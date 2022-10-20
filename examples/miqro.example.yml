@@ -1,0 +1,218 @@
+############################################################
+##                                                        ##
+## Example configuration file for miqro_alarm             ##
+##                                                        ##
+## Move this file to /etc/miqro.yml to use!               ##
+##                                                        ##
+############################################################
+
+# Define the connection to the MQTT broker
+broker:
+  host: localhost
+  port: 1883
+  keepalive: 60
+
+# Log Level
+log_level: DEBUG
+
+# Now the MIQRO services
+services:
+  alarm:
+    # Optional
+    probe:
+      http_post: https://totmann.danielfett.de/check/<redacted>/finished  # For a dead-mans switch, check totmann.danielfett.de
+      repeat:
+        minutes: 1
+
+    # Switch outputs are MQTT topics that expect technical messages,
+    # e.g., a light switch or a siren.
+    # Required - can be empty
+    switch_outputs:
+      # Name of the output
+      siren:
+        # For switch outputs, multiple 'schedules' can be defined.
+        # E.g., to create a different pattern for intrusion alarms and other alarms
+        intrusion:
+          # When this schedule is called in a prealarm, do this:
+          prealarm:
+            mqtt: service/energy/siren/timer    # MQTT topic to send message to 
+            message: "0.4"                      # Message to send
+            repeat:                             # If desired, repeat this message after the defined interval has elapsed
+              seconds: 3
+          # When this schedule is called in an alarm, do this:
+          alarm:
+            mqtt: service/energy/siren/command
+            message: "1"
+            repeat:
+              seconds: 5
+          # Do this to reset the output, also when switching between prealarm and alarm
+          reset:
+            mqtt: service/energy/siren/command
+            message: "0"
+        other_alarm:
+          alarm:
+            mqtt: service/energy/siren/timer
+            message: "2"
+
+    # Required - can be empty
+    text_outputs:
+      sms_owner:
+        mqtt: service/uplink/sms/send/555111666
+        info: True # Whether or not to send less-important 'info' messages to this output
+      pushover_alarm:
+        mqtt: service/pushover/send/alarm
+      pushover_info:
+        mqtt: service/pushover/send/info
+        info: True
+      alarm_export:
+        mqtt: export/alarm/global
+
+    # Required
+    groups:
+      # New alarm group with the internal name "intrusion" and label "Einbruch"
+      - name: intrusion
+        label: "Einbruch"
+
+        # Prealarm - run before actual alarm to allow time to disable alarm
+        prealarm:
+          seconds: 20
+
+        # Actual alarm inputs
+        inputs:
+          - mqtt: service/can/door/front_left   # as above
+            when: "is_on(value)"                # Python expression for evaluating the MQTT message received. 
+                                                # If it evaluates to true, the alarm is raised.
+            label: "Tür vorne links offen"      # as above
+          - mqtt: zigbee/some_sensor
+            when: "not value_json['contact']"   # value_json is the JSON-decoded value, if received in JSON format
+            label: "Fenster offen"
+            silence_timeout:
+
+        # Liveness probes - alert if services this alarm depends on are stopped or broken
+        liveness:
+          - mqtt: service/can/online      # MQTT topic
+            when: "is_on(value)"          # Python expression for evaluating the MQTT message received. 
+                                          # If it evaluates to true, the input is 'live'.
+                                          # value is the MQTT message. 'is_on' checks that a 'true-ish' value is received
+            label: "CAN service"          # Label for messages
+          - mqtt: service/uplink/online
+            when: "is_on(value)"
+            label: "Uplink service"
+            silence_timeout:              # disable silence detection for this topic, i.e., 
+                                          # this output is considered "dead" only when value is 0 or false
+          - mqtt: service/node-red/online
+            when: "is_on(value)"
+            label: "Node-Red"
+            silence_timeout:
+          - mqtt: zigbee/bridge/state
+            when: "value == 'online'"
+            label: "Zigbee Bridge"
+            silence_timeout:
+          - mqtt: zigbee/some_sensor/availability
+            when: "value == 'online'"
+            label: "Fenstersensor"
+            silence_timeout:
+            invalid_response_timeout:
+              seconds: 10                 # tolerate "dead" inputs for this amount of time
+
+        # Alarms are inhibited when these inputs are 'on'
+        inhibitors: 
+          - mqtt: tracker/owner
+            when: "is_on(value)"
+            label: "Besitzer's Tracker verbunden"
+
+        # Alarm outputs 
+        outputs:
+          prealarm:
+            # For switch_outputs: Name of the output plus the schedule to run
+            - siren: intrusion
+            # For text outputs: Just the name of the output
+            - sms_owner
+          alarm:
+            - siren: intrusion
+            - sms_owner
+            - pushover_alarm
+            - alarm_export
+
+      - name: frost
+        label: "Frost"
+        prealarm:
+          seconds: 180
+
+        # This alarm resets itself if the sensors send allowed values.
+        reset_delay:
+          seconds: 120
+
+        # This alarm is enabled after launch
+        default_enabled: True
+        inputs:
+          - mqtt: womotempesp/sensor/temp_sensor_2/state
+            when: "value_float < 2"       # value_float is the message parsed into a float
+            label: "Wassersystem Küche"
+            format: "{value_float:.0f}°C" # output format in messages for this value
+          - mqtt: service/sensors/temperature/inside
+            when: "value_float < 8"
+            label: "Innen"
+            format: "{value_float:.0f}°C"
+        liveness:
+          - mqtt: service/sensors/online
+            when: "is_on(value)"
+            label: "Sensors service"
+          - mqtt: womotempesp/status
+            when: "value == 'online'"
+            label: "WomoTempESP"
+            silence_timeout: 
+        outputs:
+          prealarm:
+            - sms_owner
+          alarm:
+            - sms_owner
+            - pushover_alarm
+            - alarm_export
+
+      - name: fridge
+        label: "Fridge"
+        reset_delay:
+          seconds: 10
+        default_enabled: False
+        liveness:
+          - mqtt: zigbee/env_fridge/availability
+            when: "value == 'online'"
+            label: "Kühlschranksensor"
+            silence_timeout:
+          - mqtt: zigbee/env_freezer/availability
+            when: "value == 'online'"
+            label: "Gefrierfachsensor"
+            silence_timeout:
+        inputs:
+          - mqtt: zigbee/env_fridge/temperature
+            when: "value_float < 0 or value_float > 11"
+            label: "Kühlschranktemperatur"
+            format: "{value_float:.1f}°C"
+          - mqtt: zigbee/env_freezer/temperature
+            when: "value_float > -3"
+            label: "Gefrierfachtemperatur"
+            format: "{value_float:.1f}°C"
+
+          - label: "Multi group AND"      # This is a virtual input that is 'on' when all of the following inputs are 'on'
+            mode: "and"
+            inputs:
+              - mqtt: group2/multi1/input1
+                when: "is_on(value)"
+                label: "Input 1"
+              - mqtt: group2/multi1/input2
+                when: "is_on(value)"
+                label: "Input 2"
+          - label: "Multi group OR"       # This is a virtual input that is 'on' when any of the following inputs are 'on'
+            mode: "or"
+            inputs:
+              - mqtt: group2/multi2/input1
+                when: "is_on(value)"
+                label: "Input 1"
+              - mqtt: group2/multi2/input2
+                when: "is_on(value)"
+                label: "Input 2"
+        outputs:
+          alarm:
+            - sms_owner
+            - pushover_info

@@ -1,0 +1,171 @@
+log_level: DEBUG
+broker: {}
+services:
+
+
+  energy:
+    waterlevel:
+      mapping_file: tests/waterlevel-mapping.csv
+    moisture:
+      voltage_min: 3.2
+      voltage_max: 0.250
+
+  alarm:
+    #probe:
+    #  http_post: https://totmann.danielfett.de/check/5251207c-d08e-4193-a6c2-d355abe03247/finished
+    #  repeat:
+    #    minutes: 1
+
+    switch_outputs:
+      sw1:
+        schedule1:
+          prealarm:
+            mqtt: switch/sw1
+            message: "schedule1-prealarm"
+            repeat:
+              seconds: 0.5
+          alarm:
+            mqtt: switch/sw1
+            message: "schedule1-alarm"
+            repeat:
+              seconds: 0.5
+          reset:
+            mqtt: switch/sw1
+            message: "schedule1-reset"
+        schedule2:
+          prealarm:
+            mqtt: switch/sw1
+            message: "schedule2-prealarm"
+            repeat:
+              seconds: 1
+          alarm:
+            mqtt: switch/sw1
+            message: "schedule2-alarm"
+            repeat:
+              seconds: 1
+          reset:
+            mqtt: switch/sw1
+            message: "schedule2-reset"
+      sw2:
+        schedule3:
+          prealarm:
+            mqtt: switch/sw2
+            message: "schedule3-prealarm"
+          alarm:
+            mqtt: switch/sw2
+            message: "schedule3-alarm"
+          reset:
+            mqtt: switch/sw2
+            message: "schedule3-reset"
+    text_outputs:
+      to1:
+        mqtt: text/to1
+        info: True
+      to2:
+        mqtt: text/to2
+      alarm_export:
+        mqtt: export/alarm/global
+    groups:
+      - name: g1
+        label: "G1 Normal alarm group"
+        prealarm:
+          seconds: 2
+        liveness:
+          - mqtt: group1/liveness1
+            when: "is_on(value)"
+            label: "Liveness 1"
+        inputs:
+          - mqtt: group1/input1
+            when: "is_on(value)"
+            label: "Input 1"
+          - mqtt: group1/input2
+            when: "is_on(value)"
+            label: "Input 2"
+            silence_timeout:
+              seconds: 1
+          - mqtt: shared/input0
+            when: "is_on(value)"
+            label: "Shared input"
+        inhibitors:
+          - mqtt: group1/inhibitor1
+            when: "is_on(value)"
+            label: "Inhibitor 1"
+        outputs:
+          prealarm:
+            - sw1: schedule1
+          alarm:
+            - sw1: schedule2
+            - to1
+
+      - name: g2
+        label: "G2 Feature test"
+        priority: 1
+        prealarm:
+          seconds: 3
+        reset_delay:
+          seconds: 1
+        default_enabled: True
+        liveness:
+          - mqtt: group2/liveness1
+            when: "is_on(value)"
+            label: "Liveness 1"
+            invalid_response_timeout:
+              seconds: 1
+            silence_timeout:
+              seconds: 2
+          - mqtt: group2/liveness2
+            when: "is_on(value)"
+            label: "Liveness 2"
+            invalid_response_timeout:
+              seconds: 1
+            silence_timeout:
+              seconds: 2
+        inputs:
+          - mqtt: group2/input1
+            when: "is_on(value)"
+            label: "Input 1"
+          - mqtt: group2/input2
+            when: "is_on(value)"
+            label: "Input 2"
+          - mqtt: shared/input0
+            when: "is_on(value)"
+            label: "Shared input"
+          - label: "Multi group AND"
+            mode: "and"
+            inputs:
+              - mqtt: group2/multi1/input1
+                when: "is_on(value)"
+                label: "Input 1"
+              - mqtt: group2/multi1/input2
+                when: "is_on(value)"
+                label: "Input 2"
+          - label: "Multi group OR"
+            mode: "or"
+            inputs:
+              - mqtt: group2/multi2/input1
+                when: "is_on(value)"
+                label: "Input 1"
+              - mqtt: group2/multi2/input2
+                when: "is_on(value)"
+                label: "Input 2"
+
+        outputs:
+          prealarm:
+            - sw1: schedule2
+            - sw2: schedule3
+            - to1
+          alarm:
+            - sw1: schedule2
+            - sw2: schedule3
+            - to1
+
+      - name: g3
+        label: "G3 Minimum group"
+        inputs:
+          - mqtt: group3/input1
+            when: "is_on(value)"
+            label: "Input 1"
+        outputs:
+          alarm:
+            - sw1: schedule2
+            - to1

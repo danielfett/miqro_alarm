@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "miqro-alarm"
+version = "0.1.0"
+description = "A universal alarm service using MQTT as input and output."
+authors = ["Daniel Fett <fett@danielfett.de>"]
+readme = "README.md"
+packages = [{include = "miqro_alarm"}]
+
+[tool.poetry.dependencies]
+python = "^3.7"
+miqro = "^1.2.0"
+requests = "^2.28.1"
+humanfriendly = "^10.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+]
+
+[tool.poetry.scripts]
+miqro_alarm = { callable = "miqro_alarm:alarm.run" }
