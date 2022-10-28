@@ -8,6 +8,12 @@ from heapq import heappush
 from humanfriendly import format_timespan
 from json import loads
 
+from pydantic import BaseModel, Field
+
+class MyBaseModel(BaseModel):
+    class Config:
+        extra = 'forbid'
+        smart_union = True
 
 class SwitchOutput:
     service: "AlarmService"
@@ -64,6 +70,38 @@ class AlarmRequest:
     group: "AlarmGroup"
     state: AlarmState = field(compare=False)
     schedule: Optional[str] = field(compare=False)
+
+
+class TimedefConfig(MyBaseModel):
+    days: Optional[int] = None
+    seconds: Optional[int] = None
+    microseconds: Optional[int] = None
+    milliseconds: Optional[int] = None
+    minutes: Optional[int] = None
+    hours: Optional[int] = None
+    weeks: Optional[int] = None
+
+
+class SwitchOutputConfig(MyBaseModel):
+    mqtt: Optional[str] = None
+    message: str
+    http_post: Optional[str] = None
+    repeat: Optional[TimedefConfig] = None
+
+
+class SwitchOutputScheduleConfig(MyBaseModel):
+    prealarm: Optional[SwitchOutputConfig] = None
+    alarm: Optional[SwitchOutputConfig] = None
+    reset: Optional[SwitchOutputConfig] = None
+
+
+class SwitchOutputGroupConfig(MyBaseModel):
+    __root__: Dict[str, SwitchOutputScheduleConfig]
+
+
+class TextOutputConfig(MyBaseModel):
+    mqtt: str
+    info: bool = False
 
 
 class SwitchOutputGroup:
@@ -218,6 +256,10 @@ class InputState(Enum):
     ONLINE = 1
 
 
+class InputConfig(MyBaseModel):
+    label: str
+
+
 class Input:
     service: "AlarmService"
     group: "AlarmGroup"
@@ -257,6 +299,17 @@ class Input:
     @staticmethod
     def create_from_liveness_input_list(service, group, list) -> List["LivenessInput"]:
         return [LivenessInput(service, group, **l) for l in list]
+
+
+class MultiInputOptions(Enum):
+    _and = "and"
+    _or = "or"
+
+
+class MultiInputConfig(InputConfig):
+    inputs: List[InputConfig]
+    # mode must be and or or
+    mode: MultiInputOptions = MultiInputOptions._and
 
 
 class MultiInput(Input):
@@ -304,6 +357,16 @@ class MultiInput(Input):
 
     def __str__(self):
         return f"{self.label} ({len(self.inputs)} inputs, '{self.mode}')"
+
+
+class MQTTInputConfig(InputConfig):
+    mqtt: str
+    when: str
+    label: str
+    format: Optional[str] = None
+    silence_timeout: TimedefConfig = Field(
+        default_factory=lambda: TimedefConfig(days=7)
+    )
 
 
 class MQTTInput(Input):
@@ -448,6 +511,10 @@ class MQTTInput(Input):
         # service saves periodically
 
 
+class LivenessInputConfig(MQTTInputConfig):
+    pass
+
+
 class LivenessInput(MQTTInput):
     invalid_response_timeout: timedelta
     invalid_response_timeout_check_loop: miqro.Loop
@@ -502,6 +569,23 @@ class LivenessInput(MQTTInput):
         self.service.warning(
             f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
         )
+
+
+class OutputConfig(MyBaseModel):
+    prealarm: List[Union[str, Dict[str, str]]] = []
+    alarm: List[Union[str, Dict[str, str]]] = []
+
+
+class AlarmGroupConfig(MyBaseModel):
+    name: str
+    label: str
+    prealarm: Optional[TimedefConfig] = None
+    inputs: List[Union[MQTTInputConfig, MultiInputConfig]] = []
+    liveness: List[LivenessInputConfig] = []
+    inhibitors: List[Union[MQTTInputConfig, MultiInputConfig]] = []
+    outputs: OutputConfig
+    reset_delay: Optional[TimedefConfig] = None
+    default_enabled: bool = False
 
 
 class AlarmGroup:
@@ -852,9 +936,16 @@ class AlarmGroup:
         return f"{self.name}/{ext}"
 
 
+class AlarmConfig(MyBaseModel):
+    switch_outputs: Dict[str, SwitchOutputGroupConfig]
+    text_outputs: Dict[str, TextOutputConfig]
+    groups: List[AlarmGroupConfig]
+
+
 class AlarmService(miqro.Service):
     SERVICE_NAME = "alarm"
     USE_STATE_FILE = True
+    CONFIG_MODEL = AlarmConfig
 
     probe: Optional[SwitchOutput] = None
     text_outputs: Dict[str, TextOutput]
@@ -867,7 +958,7 @@ class AlarmService(miqro.Service):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
+        self.pyd = AlarmConfig(**self.service_config)
         self.started = datetime.now()
 
         if self.service_config.get("probe", None):
