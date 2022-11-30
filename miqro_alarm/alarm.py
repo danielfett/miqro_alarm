@@ -35,7 +35,7 @@ class SwitchOutput:
             self.service.publish(self.mqtt, self.message, global_=True)
         if self.http_post:
             try:
-                requests.post(self.http_post)
+                requests.post(self.http_post, timeout=10)
             except Exception as e:
                 self.service.log.error(f"Error posting to {self.http_post}: {e}")
 
@@ -227,7 +227,7 @@ class Input:
     last_update: Optional[datetime] = None
     state: InputState = InputState.UNKNOWN
 
-    def __init__(self, service, group, label):
+    def __init__(self, service, group, label, debounce=None):
         self.service = service
         self.group = group
         self.label = label
@@ -257,6 +257,21 @@ class Input:
     @staticmethod
     def create_from_liveness_input_list(service, group, list) -> List["LivenessInput"]:
         return [LivenessInput(service, group, **l) for l in list]
+
+    def _handle_change(self, new_eval_value):
+        if new_eval_value == self.last_eval_value:
+            return False
+
+        self.service.log.info(
+            f"Group {self.group}, input {self} | Evaluated value changed to {new_eval_value}"
+        )
+        self.last_eval_value = new_eval_value
+        if new_eval_value:
+            self.group.on(self)
+        else:
+            self.group.off(self)
+
+        return True
 
 
 class MultiInput(Input):
@@ -288,16 +303,7 @@ class MultiInput(Input):
 
     def on(self, input):
         new_eval_value = self.get_last_value()
-
-        if new_eval_value != self.last_eval_value:
-            self.service.log.info(
-                f"Group {self.group}, multi input {self} | Evaluated value changed to {new_eval_value}"
-            )
-            self.last_eval_value = new_eval_value
-            if new_eval_value:
-                self.group.on(self)
-            else:
-                self.group.off(self)
+        self._handle_change(new_eval_value)
 
     def off(self, input):
         self.on(input)
@@ -311,7 +317,6 @@ class MQTTInput(Input):
     condition: str
     format: Optional[str]
 
-    silence_timeout: Optional[timedelta]
     silence_timeout_check_loop: Optional[miqro.Loop] = None
 
     last_raw_value: Optional[str] = None
@@ -325,7 +330,7 @@ class MQTTInput(Input):
         when,
         label,
         format=None,
-        silence_timeout={"days": 7},
+        silence_timeout: Optional[timedelta]={"days": 7},
     ):
         super().__init__(service, group, label)
         self.mqtt = mqtt
@@ -335,13 +340,10 @@ class MQTTInput(Input):
         self.service.add_global_handler(self.mqtt, self.handle)
 
         if silence_timeout is None:
-            self.silence_timeout = None
             return
-        else:
-            self.silence_timeout = timedelta(**silence_timeout)
 
         self.silence_timeout_check_loop = miqro.Loop(
-            self._check_silence_timeout, self.silence_timeout, False
+            self._check_silence_timeout, timedelta(**silence_timeout), False
         )
         self.service.add_loop(self.silence_timeout_check_loop)
         self.silence_timeout_check_loop.start(delayed=True)
@@ -384,16 +386,8 @@ class MQTTInput(Input):
             )
             new_eval_value = self.last_eval_value
 
-        if new_eval_value != self.last_eval_value:
-            self.service.log.info(
-                f"Group {self.group}, input {self} | Evaluated value changed to {new_eval_value} (raw: {raw_value})"
-            )
-            self.last_eval_value = new_eval_value
+        if self._handle_change(new_eval_value):
             self._store_state()
-            if new_eval_value:
-                self.group.on(self)
-            else:
-                self.group.off(self)
 
     @staticmethod
     def try_float(inval):
@@ -421,7 +415,7 @@ class MQTTInput(Input):
     def _check_silence_timeout(self, _):
         self.state = InputState.OFFLINE
         if self.last_update is None:
-            assert self.silence_timeout is not None
+            assert self.silence_timeout_check_loop is not None
             span = datetime.now() - self.service.started
             self.service.warning(
                 f"Group {self.group}, input {self}: Silent since launch ({format_timespan(span)} ago)"
@@ -483,25 +477,32 @@ class LivenessInput(MQTTInput):
         if self.silence_timeout_check_loop:
             self.silence_timeout_check_loop.restart(delayed=True)
 
-        new_eval_value = eval(
-            self.condition, {"value": raw_value, "is_on": is_on, "is_off": is_off}
+        self._handle_change(
+            eval(self.condition, {"value": raw_value, "is_on": is_on, "is_off": is_off})
         )
-        if new_eval_value != self.last_eval_value:
-            self.service.log.info(
-                f"Group {self.group}, liveness input {self} | Evaluated value changed to {new_eval_value} (raw: {raw_value})"
-            )
-            self.last_eval_value = new_eval_value
-            if new_eval_value:
-                self.state = InputState.ONLINE
-                self.invalid_response_timeout_check_loop.stop()
-            else:
-                self.state = InputState.INVALID_RESPONSE
-                self.invalid_response_timeout_check_loop.start(delayed=True)
 
     def check_invalid_response_timeout(self, _):
         self.service.warning(
             f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
         )
+
+    def _handle_change(self, new_eval_value):
+        if new_eval_value == self.last_eval_value:
+            return False
+
+        self.service.log.info(
+            f"Group {self.group}, liveness input {self} | Evaluated value changed to {new_eval_value}"
+        )
+        self.last_eval_value = new_eval_value
+
+        if new_eval_value:
+            self.state = InputState.ONLINE
+            self.invalid_response_timeout_check_loop.stop()
+        else:
+            self.state = InputState.INVALID_RESPONSE
+            self.invalid_response_timeout_check_loop.start(delayed=True)
+
+        return True
 
 
 class AlarmGroup:
