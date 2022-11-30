@@ -330,7 +330,7 @@ class MQTTInput(Input):
         when,
         label,
         format=None,
-        silence_timeout: Optional[timedelta]={"days": 7},
+        silence_timeout: Optional[Dict] = {"days": 7},
     ):
         super().__init__(service, group, label)
         self.mqtt = mqtt
@@ -339,14 +339,12 @@ class MQTTInput(Input):
 
         self.service.add_global_handler(self.mqtt, self.handle)
 
-        if silence_timeout is None:
-            return
-
-        self.silence_timeout_check_loop = miqro.Loop(
-            self._check_silence_timeout, timedelta(**silence_timeout), False
-        )
-        self.service.add_loop(self.silence_timeout_check_loop)
-        self.silence_timeout_check_loop.start(delayed=True)
+        if silence_timeout is not None:
+            self.silence_timeout_check_loop = miqro.Loop(
+                self._check_silence_timeout, timedelta(**silence_timeout), False
+            )
+            self.service.add_loop(self.silence_timeout_check_loop)
+            self.silence_timeout_check_loop.start(delayed=True)
 
         self.store_state_loop = miqro.Loop(
             self._store_state, timedelta(seconds=30), False
