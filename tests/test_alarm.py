@@ -710,3 +710,42 @@ def test_alarm_input_and(service):
         },
         2,
     )
+
+
+def test_debounce(service):
+    send(service, "service/alarm/g4/enabled/command", "1")
+    send(service, "group4/input1", "1")
+    # do not expect any message in the next 0.8 seconds
+    expect_next(
+        service,
+        {
+            "service/alarm/g4/state": 'm == "off"',
+            "switch/sw1": None,
+        },
+        0.8,
+    )
+    # reset input to previous value - nothing should happen
+    send(service, "group4/input1", "0")
+    # do not expect any message in the next 2 seconds
+    expect_next(
+        service,
+        {
+            "service/alarm/g4/state": None,
+            "switch/sw1": None,
+        },
+        2,
+    )
+    # trigger the alarm again, but now wait a second afterwards
+    send(service, "group4/input1", "1")
+    # do not expect any message in the next 0.8 seconds
+    run(service, 0.9)
+
+    # expect sw1 three times in a row
+    expect_next(
+        service,
+        {
+            "service/alarm/g4/state": 'm == "alarm"',
+        },
+        1.9,
+    )
+

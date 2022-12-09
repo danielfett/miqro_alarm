@@ -154,6 +154,8 @@ services:
             when: "value_float < 8"
             label: "Innen"
             format: "{value_float:.0f}°C"
+            debounce:
+              seconds: 30  # ignore a state change unless it has been stable for 30 seconds
         liveness:
           - mqtt: service/sensors/online
             when: "is_on(value)"

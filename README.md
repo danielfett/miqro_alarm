@@ -7,6 +7,7 @@ Features:
  * Listens to MQTT topics for alarm inputs
  * Custom conditions for alarms can be expressed, e.g., if a value rises above a certain threshold
  * Prealarms are supported - raise awareness to an issue before the full alarm is triggered, or allow time for disabling the alarm
+ * Debouncing of input signals is supported, e.g., to avoid false alarms due to sensor noise
  * Alarm outputs:
     * Text messages sent to MQTT topics (e.g., an SMS gateway, push message provider, etc.) 
     * Switch outputs, i.e., MQTT topics expecting custom messages (e.g., to connect to other MQTT services or to drive lights, sirens, etc.)

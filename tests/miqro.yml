@@ -169,3 +169,17 @@ services:
           alarm:
             - sw1: schedule2
             - to1
+
+      - name: g4
+        label: "Testing Debounce"
+        default_enabled: False
+        inputs:
+          - mqtt: group4/input1
+            when: "is_on(value)"
+            label: "Input 1"
+            debounce:
+              seconds: 1
+        outputs:
+          alarm:
+            - sw1: schedule2
+            - to1

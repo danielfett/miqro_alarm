@@ -227,10 +227,20 @@ class Input:
     last_update: Optional[datetime] = None
     state: InputState = InputState.UNKNOWN
 
+    debounce_timeout_check_loop: Optional[miqro.Loop] = None
+    debounce_observed_value = None
+
     def __init__(self, service, group, label, debounce=None):
         self.service = service
         self.group = group
         self.label = label
+
+        if debounce:
+            # create debounce loop
+            self.debounce_timeout_check_loop = miqro.Loop(
+                self._debounce_timeout_check, timedelta(**debounce), start=False
+            )
+            self.service.add_loop(self.debounce_timeout_check_loop)
 
     def get_last_value(self):
         return self.last_eval_value
@@ -259,9 +269,34 @@ class Input:
         return [LivenessInput(service, group, **l) for l in list]
 
     def _handle_change(self, new_eval_value):
-        if new_eval_value == self.last_eval_value:
-            return False
+        if not self.debounce_timeout_check_loop:
+            if new_eval_value == self.last_eval_value:
+                return False
+            self._commit(new_eval_value)
+        else:
+            if self.debounce_observed_value is None:
+                # no state change observed yet, see if the new value changes state
+                if new_eval_value is not self.last_eval_value:
+                    # if yes, start the observation
+                    self.debounce_observed_value = new_eval_value
+                    self.debounce_timeout_check_loop.start(delayed=True)
+                else:
+                    # if not, ignore, as there was no value change
+                    pass
+            else:
+                # An observation is running already. There are two cases:
 
+                # 1. The new value is the same as the pre-observation value. We reset the observation.
+                if new_eval_value is not self.debounce_observed_value:
+                    self.debounce_observed_value = None
+                    self.debounce_timeout_check_loop.stop()
+
+                # 2. Otherwise, continue observation.
+                else:
+                    pass
+        return True
+
+    def _commit(self, new_eval_value):
         self.service.log.info(
             f"Group {self.group}, input {self} | Evaluated value changed to {new_eval_value}"
         )
@@ -271,7 +306,11 @@ class Input:
         else:
             self.group.off(self)
 
-        return True
+    def _debounce_timeout_check(self, _):
+        self._commit(self.debounce_observed_value)
+        self.debounce_observed_value = None
+        assert self.debounce_timeout_check_loop
+        self.debounce_timeout_check_loop.stop()
 
 
 class MultiInput(Input):
@@ -329,10 +368,11 @@ class MQTTInput(Input):
         *,
         when,
         label,
+        debounce=None,
         format=None,
         silence_timeout: Optional[Dict] = {"days": 7},
     ):
-        super().__init__(service, group, label)
+        super().__init__(service, group, label, debounce)
         self.mqtt = mqtt
         self.condition = when
         self.format = format
@@ -346,20 +386,13 @@ class MQTTInput(Input):
             self.service.add_loop(self.silence_timeout_check_loop)
             self.silence_timeout_check_loop.start(delayed=True)
 
+        self._load_state()
+
         self.store_state_loop = miqro.Loop(
             self._store_state, timedelta(seconds=30), False
         )
         self.service.add_loop(self.store_state_loop)
         self.store_state_loop.start(delayed=True)
-
-        stored_state = self.service.state.get_path(
-            "mqtt_input", self.mqtt, self.condition, "last_state", default=None
-        )
-        if stored_state is not None:
-            self.last_raw_value = stored_state["last_raw_value"]
-            self.last_eval_value = stored_state["last_eval_value"]
-            self.last_update = stored_state["last_update"]
-            self.state = InputState(stored_state["state"])
 
     def handle(self, _, raw_value):
         self.last_update = datetime.now()
@@ -384,8 +417,8 @@ class MQTTInput(Input):
             )
             new_eval_value = self.last_eval_value
 
-        if self._handle_change(new_eval_value):
-            self._store_state()
+        self._handle_change(new_eval_value)
+        self._store_state()
 
     @staticmethod
     def try_float(inval):
@@ -425,6 +458,8 @@ class MQTTInput(Input):
             )
 
     def _store_state(self, _=None):
+        # service saves periodically
+        assert self.service.state
         self.service.state.set_path(
             "mqtt_input",
             self.mqtt,
@@ -437,7 +472,17 @@ class MQTTInput(Input):
                 "state": self.state.value,
             },
         )
-        # service saves periodically
+
+    def _load_state(self):
+        assert self.service.state
+        stored_state = self.service.state.get_path(
+            "mqtt_input", self.mqtt, self.condition, "last_state", default=None
+        )
+        if stored_state is not None:
+            self.last_raw_value = stored_state["last_raw_value"]
+            self.last_eval_value = stored_state["last_eval_value"]
+            self.last_update = stored_state["last_update"]
+            self.state = InputState(stored_state["state"])
 
 
 class LivenessInput(MQTTInput):
