@@ -272,6 +272,10 @@ class Input:
         if not self.debounce_timeout_check_loop:
             if new_eval_value == self.last_eval_value:
                 return False
+            self.service.log.debug(
+                f"Group {self.group}, input {self} | No debounce, committing directly"
+                    
+            )
             self._commit(new_eval_value)
         else:
             if self.debounce_observed_value is None:
@@ -280,8 +284,14 @@ class Input:
                     # if yes, start the observation
                     self.debounce_observed_value = new_eval_value
                     self.debounce_timeout_check_loop.start(delayed=True)
+                    self.service.log.debug(
+                        f"Group {self.group}, input {self} | Value changed to {new_eval_value}, but waiting for debounce timeout"
+                    )
                 else:
                     # if not, ignore, as there was no value change
+                    self.service.log.debug(
+                        f"Group {self.group}, input {self} | Value changed to {new_eval_value}, but same as before - ignoring"
+                    )
                     pass
             else:
                 # An observation is running already. There are two cases:
@@ -290,9 +300,15 @@ class Input:
                 if new_eval_value is not self.debounce_observed_value:
                     self.debounce_observed_value = None
                     self.debounce_timeout_check_loop.stop()
+                    self.service.log.debug(
+                        f"Group {self.group}, input {self} | Value changed back to {new_eval_value}, stopped debounce observation"
+                    )
 
                 # 2. Otherwise, continue observation.
                 else:
+                    self.service.log.debug(
+                        f"Group {self.group}, input {self} | Value changed to {new_eval_value}, same as running observation"
+                    )
                     pass
         return True
 
@@ -307,10 +323,12 @@ class Input:
             self.group.off(self)
 
     def _debounce_timeout_check(self, _):
+        self.service.log.info(
+            f"Group {self.group}, input {self} | Observation timed out, comitting {self.debounce_observed_value}"
+        )
         self._commit(self.debounce_observed_value)
         self.debounce_observed_value = None
-        assert self.debounce_timeout_check_loop
-        self.debounce_timeout_check_loop.stop()
+        return False  # stop loop
 
 
 class MultiInput(Input):
