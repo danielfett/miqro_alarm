@@ -274,7 +274,6 @@ class Input:
                 return False
             self.service.log.debug(
                 f"Group {self.group}, input {self} | No debounce, committing directly"
-                    
             )
             self._commit(new_eval_value)
         else:
@@ -442,7 +441,7 @@ class MQTTInput(Input):
     def try_float(inval):
         try:
             return float(inval)
-        except ValueError:
+        except (ValueError, TypeError):
             return float("NaN")
 
     @staticmethod
@@ -632,9 +631,15 @@ class AlarmGroup:
                     self.text_outputs[alarm_type].append(output)
 
         assert self.service.state
-        self.enabled = self.service.state.get_path(
-            "group_enabled", self.name, default=default_enabled
+        stored_state = self.service.state.get_path(
+            "group_enabled", self.name, default=None
         )
+        if stored_state is None:
+            self.enabled = default_enabled
+            self.service.log.info(f"Using default state for group {self}: {self.enabled}")
+        else:
+            self.enabled = stored_state
+            self.service.log.info(f"Using stored state for group {self}: {self.enabled}")
 
         self.inhibit_timeout_loop = miqro.Loop(
             self.inhibit_timeout, timedelta(minutes=1), False
@@ -814,7 +819,7 @@ class AlarmGroup:
         )
 
     def get_state(self):
-        self.service.log.info(f"{self} | Assembling state")
+        self.service.log.debug(f"{self} | Assembling state")
 
         if not self.enabled:
             display_state = "disabled"
