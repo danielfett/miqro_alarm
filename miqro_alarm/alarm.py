@@ -158,6 +158,9 @@ class TextOutput:
             heappush(self.groups, group)
 
     def update(self):
+        # TODO: 
+        # The text output needs no update if no alarm is active any longer in case it is an "alarm" or "prealarm" group output.
+        # The text output should send a "reset" message if no alarm is active any longer in case it is a "reset" group output.
         alarm_information = {
             group.label: self._get_group_information(group)
             for group in self.groups
@@ -689,6 +692,7 @@ class AlarmGroup:
         )
 
     def on(self, input):
+        self.update_sensor_stream(input)
         self.service.log.info(f" {self} | {input} is on, from state: {self.state}")
 
         if input in self.inhibitors:
@@ -718,6 +722,7 @@ class AlarmGroup:
             self.update_outputs()
 
     def off(self, input):
+        self.update_sensor_stream(input)
         if not self.state in [AlarmState.ALARM, AlarmState.PREALARM]:
             return
 
@@ -803,6 +808,11 @@ class AlarmGroup:
         for _, outputs in self.switch_outputs.items():
             for output, __ in outputs:
                 output.request(self, self.state, None)
+
+        # Reset text outputs: They react only when a *new* input has triggered; so reset after the alarm is required
+        for _, outputs in self.text_outputs.items():
+            for output in outputs:
+                output.update()
 
     def inhibit_timeout(self, _):
         self.inhibited_by_command = False
@@ -914,6 +924,18 @@ class AlarmGroup:
         assert self.service.state
         self.service.state.set_path("group_enabled", self.name, value=enabled)
         self.service.state.save()
+
+    def update_sensor_stream(self, input):
+        # input has changed from on to off or vice-versa. now send a nicely formatted
+        # message to the sensor stream, i.e., this group's mqtt topic plus 'sensor_stream.
+        # the message is formatted like the text message, e.g., "Now: Door open" or "Not any longer: Door open".
+
+        if input.get_last_value():
+            message = f"Active: {input.label}"
+        else:
+            message = f"Inactive: {input.label}"
+        
+        self.service.publish(self._mqtt_topic("sensor_stream"), message)
 
     def _mqtt_topic(self, ext):
         return f"{self.name}/{ext}"
