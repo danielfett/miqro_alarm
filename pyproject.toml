@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "miqro-alarm"
-version = "0.2.1"
+version = "0.2.2"
 description = "A universal alarm service using MQTT as input and output."
 authors = ["Daniel Fett <fett@danielfett.de>"]
 readme = "README.md"
