@@ -109,16 +109,16 @@ class SwitchOutputGroup:
         self.current_schedule = target.schedule
         self.state = target.state
 
-    def request(self, group, state: AlarmState, schedule: Optional[str]):
+    def request(self, group, schedule: Optional[str]):
         self.service.log.info(
-            f"Output {self} | Request {state.name} for group: {group}"
+            f"Output {self} | Request {group.state} for group: {group}"
         )
         for request in self.requests:
             if request.group == group:
                 del self.requests[self.requests.index(request)]
 
-        if state != AlarmState.OFF:
-            heappush(self.requests, AlarmRequest(group, state, schedule))
+        if group.state != AlarmState.OFF:
+            heappush(self.requests, AlarmRequest(group, group.state, schedule))
 
         if len(self.requests) == 0:
             self.service.log.info(f"Output {self} | No requests, setting state to OFF")
@@ -157,7 +157,7 @@ class TextOutput:
         if not group in self.groups:
             heappush(self.groups, group)
 
-    def update(self):
+    def update(self, update_reason: "UpdateReason"):
         # TODO: 
         # The text output needs no update if no alarm is active any longer in case it is an "alarm" or "prealarm" group output.
         # The text output should send a "reset" message if no alarm is active any longer in case it is a "reset" group output.
@@ -174,7 +174,7 @@ class TextOutput:
         if alarm_information != self.published_alarm_information:
             self.published_alarm_information = alarm_information
             self.service.publish(
-                self.mqtt, self._format_msg(alarm_information), global_=True
+                self.mqtt, self._format_msg(alarm_information, update_reason), global_=True
             )
 
     def send_info(self, message):
@@ -192,10 +192,10 @@ class TextOutput:
             ],
         }
 
-    def _format_msg(self, alarm_information):
+    def _format_msg(self, alarm_information, update_reason):
         output_strings = []
         for label, g in alarm_information.items():
-            group_info = f"{g['state']} {label}: "
+            group_info = f"{str(update_reason)}, {label}: "
             group_info += ", ".join(input["name"] for input in g["inputs"])
             output_strings.append(group_info)
         return "\n".join(output_strings)
@@ -220,6 +220,28 @@ class InputState(Enum):
     OFFLINE = 0
     ONLINE = 1
 
+
+class UpdateReason(Enum):
+    SWITCH_TO_OFF = 0
+    SWITCH_TO_PREALARM = 1
+    SWITCH_TO_ALARM = 2
+    UPDATE_ALARM = 3
+
+    def yaml_identifier(self):
+        return {
+            UpdateReason.SWITCH_TO_OFF: "off",
+            UpdateReason.SWITCH_TO_PREALARM: "prealarm",
+            UpdateReason.SWITCH_TO_ALARM: "alarm",
+            UpdateReason.UPDATE_ALARM: "update",
+        }[self]
+
+    def __str__(self):
+        return {
+            UpdateReason.SWITCH_TO_OFF: "Off",
+            UpdateReason.SWITCH_TO_PREALARM: "Prealarm",
+            UpdateReason.SWITCH_TO_ALARM: "ALARM",
+            UpdateReason.UPDATE_ALARM: "Update",
+        }[self]
 
 class Input:
     service: "AlarmService"
@@ -528,10 +550,10 @@ class LivenessInput(MQTTInput):
             silence_timeout=silence_timeout,
         )
         self.invalid_response_timeout = timedelta(**invalid_response_timeout)
-        self.invalid_response_timeout_check_loop = miqro.Loop(
-            self.check_invalid_response_timeout, self.invalid_response_timeout, False
-        )
-        self.service.add_loop(self.invalid_response_timeout_check_loop)
+        #self.invalid_response_timeout_check_loop = miqro.Loop(
+        #    self.check_invalid_response_timeout, self.invalid_response_timeout, False
+        #)
+        #self.service.add_loop(self.invalid_response_timeout_check_loop)
 
     def handle(self, _, raw_value):
         self.last_update = datetime.now()
@@ -541,13 +563,19 @@ class LivenessInput(MQTTInput):
             self.silence_timeout_check_loop.restart(delayed=True)
 
         self._handle_change(
-            eval(self.condition, {"value": raw_value, "is_on": is_on, "is_off": is_off})
+            eval(self.condition, {
+                    "value": raw_value,
+                    "value_float": self.try_float(raw_value),
+                    "value_json": self.try_json(raw_value),
+                    "is_on": is_on,
+                    "is_off": is_off,
+                })
         )
 
-    def check_invalid_response_timeout(self, _):
-        self.service.warning(
-            f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
-        )
+    #def check_invalid_response_timeout(self, _):
+    #    self.service.warning(
+    #        f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
+    #    )
 
     def _handle_change(self, new_eval_value):
         if new_eval_value == self.last_eval_value:
@@ -560,10 +588,13 @@ class LivenessInput(MQTTInput):
 
         if new_eval_value:
             self.state = InputState.ONLINE
-            self.invalid_response_timeout_check_loop.stop()
+            #self.invalid_response_timeout_check_loop.stop()
         else:
             self.state = InputState.INVALID_RESPONSE
-            self.invalid_response_timeout_check_loop.start(delayed=True)
+            #self.invalid_response_timeout_check_loop.start(delayed=True)
+            self.service.warning(
+                f"Group {self.group}, liveness input {self}: Invalid response ({self.last_raw_value})!"
+            )
 
         return True
 
@@ -719,7 +750,7 @@ class AlarmGroup:
         if self.state == AlarmState.OFF:
             self.do_prealarm(trigger=input)
         elif self.state in (AlarmState.PREALARM, AlarmState.ALARM):
-            self.update_outputs()
+            self.update_outputs(UpdateReason.UPDATE_ALARM)
 
     def off(self, input):
         self.update_sensor_stream(input)
@@ -728,9 +759,9 @@ class AlarmGroup:
 
         self.service.log.info(f" {self} | {input} is off, from state: {self.state}")
 
-        self.update_outputs()
 
         if not self.reset_delay:  # never reset this alarm automatically
+            #self.update_outputs(UpdateReason.UPDATE_ALARM)
             return
 
         assert self.alarm_to_reset_loop
@@ -755,7 +786,7 @@ class AlarmGroup:
         assert self.state != AlarmState.PREALARM
 
         self.state = AlarmState.PREALARM
-        self.update_outputs()
+        self.update_outputs(UpdateReason.SWITCH_TO_PREALARM)
         self.service.request_publish_info()
 
         if self.prealarm:
@@ -769,7 +800,7 @@ class AlarmGroup:
         assert self.state != AlarmState.ALARM
 
         self.state = AlarmState.ALARM
-        self.update_outputs()
+        self.update_outputs(UpdateReason.SWITCH_TO_ALARM)
         self.service.request_publish_info()
 
         if self.prealarm:
@@ -797,22 +828,22 @@ class AlarmGroup:
 
         return False  # stop the reset loop if triggered from there
 
-    def update_outputs(self):
+    def update_outputs(self, update_reason: UpdateReason):
         for output, schedule in self.switch_outputs.get(self.state.name.lower(), []):
-            output.request(self, self.state, schedule)
+            output.request(self, schedule)
 
         for output in self.text_outputs.get(self.state.name.lower(), []):
-            output.update()
+            output.update(update_reason)
 
     def reset_outputs(self):
         for _, outputs in self.switch_outputs.items():
             for output, __ in outputs:
-                output.request(self, self.state, None)
+                output.request(self, None)
 
         # Reset text outputs: They react only when a *new* input has triggered; so reset after the alarm is required
         for _, outputs in self.text_outputs.items():
             for output in outputs:
-                output.update()
+                output.update(UpdateReason.SWITCH_TO_OFF)
 
     def inhibit_timeout(self, _):
         self.inhibited_by_command = False
