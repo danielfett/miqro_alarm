@@ -1,12 +1,12 @@
-[tool.poetry]
+[project]
 name = "miqro-alarm"
 version = "0.2.2"
 description = "A universal alarm service using MQTT as input and output."
-authors = ["Daniel Fett <fett@danielfett.de>"]
+authors = [{name = "Daniel Fett", email = "fett@danielfett.de"}]
 readme = "README.md"
 packages = [{include = "miqro_alarm"}]
 
-[tool.poetry.dependencies]
+[dependencies]
 python = "^3.7"
 miqro = "^1.2.0"
 requests = "^2.28.1"
@@ -23,3 +23,7 @@ addopts = [
 
 [tool.poetry.scripts]
 miqro_alarm = { callable = "miqro_alarm:alarm.run" }
+
+[project.scripts]
+miqro_alarm = "miqro_alarm:alarm.run"
+
