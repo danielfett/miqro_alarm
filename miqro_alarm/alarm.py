@@ -158,7 +158,7 @@ class TextOutput:
             heappush(self.groups, group)
 
     def update(self, update_reason: "UpdateReason"):
-        # TODO: 
+        # TODO:
         # The text output needs no update if no alarm is active any longer in case it is an "alarm" or "prealarm" group output.
         # The text output should send a "reset" message if no alarm is active any longer in case it is a "reset" group output.
         alarm_information = {
@@ -174,7 +174,9 @@ class TextOutput:
         if alarm_information != self.published_alarm_information:
             self.published_alarm_information = alarm_information
             self.service.publish(
-                self.mqtt, self._format_msg(alarm_information, update_reason), global_=True
+                self.mqtt,
+                self._format_msg(alarm_information, update_reason),
+                global_=True,
             )
 
     def send_info(self, message):
@@ -242,6 +244,7 @@ class UpdateReason(Enum):
             UpdateReason.SWITCH_TO_ALARM: "ALARM",
             UpdateReason.UPDATE_ALARM: "Update",
         }[self]
+
 
 class Input:
     service: "AlarmService"
@@ -550,10 +553,10 @@ class LivenessInput(MQTTInput):
             silence_timeout=silence_timeout,
         )
         self.invalid_response_timeout = timedelta(**invalid_response_timeout)
-        #self.invalid_response_timeout_check_loop = miqro.Loop(
+        # self.invalid_response_timeout_check_loop = miqro.Loop(
         #    self.check_invalid_response_timeout, self.invalid_response_timeout, False
-        #)
-        #self.service.add_loop(self.invalid_response_timeout_check_loop)
+        # )
+        # self.service.add_loop(self.invalid_response_timeout_check_loop)
 
     def handle(self, _, raw_value):
         self.last_update = datetime.now()
@@ -563,16 +566,19 @@ class LivenessInput(MQTTInput):
             self.silence_timeout_check_loop.restart(delayed=True)
 
         self._handle_change(
-            eval(self.condition, {
+            eval(
+                self.condition,
+                {
                     "value": raw_value,
                     "value_float": self.try_float(raw_value),
                     "value_json": self.try_json(raw_value),
                     "is_on": is_on,
                     "is_off": is_off,
-                })
+                },
+            )
         )
 
-    #def check_invalid_response_timeout(self, _):
+    # def check_invalid_response_timeout(self, _):
     #    self.service.warning(
     #        f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
     #    )
@@ -588,10 +594,10 @@ class LivenessInput(MQTTInput):
 
         if new_eval_value:
             self.state = InputState.ONLINE
-            #self.invalid_response_timeout_check_loop.stop()
+            # self.invalid_response_timeout_check_loop.stop()
         else:
             self.state = InputState.INVALID_RESPONSE
-            #self.invalid_response_timeout_check_loop.start(delayed=True)
+            # self.invalid_response_timeout_check_loop.start(delayed=True)
             self.service.warning(
                 f"Group {self.group}, liveness input {self}: Invalid response ({self.last_raw_value})!"
             )
@@ -670,10 +676,14 @@ class AlarmGroup:
         )
         if stored_state is None:
             self.enabled = default_enabled
-            self.service.log.info(f"Using default state for group {self}: {self.enabled}")
+            self.service.log.info(
+                f"Using default state for group {self}: {self.enabled}"
+            )
         else:
             self.enabled = stored_state
-            self.service.log.info(f"Using stored state for group {self}: {self.enabled}")
+            self.service.log.info(
+                f"Using stored state for group {self}: {self.enabled}"
+            )
 
         self.inhibit_timeout_loop = miqro.Loop(
             self.inhibit_timeout, timedelta(minutes=1), False
@@ -759,9 +769,8 @@ class AlarmGroup:
 
         self.service.log.info(f" {self} | {input} is off, from state: {self.state}")
 
-
         if not self.reset_delay:  # never reset this alarm automatically
-            #self.update_outputs(UpdateReason.UPDATE_ALARM)
+            # self.update_outputs(UpdateReason.UPDATE_ALARM)
             return
 
         assert self.alarm_to_reset_loop
@@ -965,7 +974,7 @@ class AlarmGroup:
             message = f"Active: {input.label}"
         else:
             message = f"Inactive: {input.label}"
-        
+
         self.service.publish(self._mqtt_topic("sensor_stream"), message)
 
     def _mqtt_topic(self, ext):

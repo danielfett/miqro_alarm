@@ -748,4 +748,3 @@ def test_debounce(service):
         },
         1.9,
     )
-
