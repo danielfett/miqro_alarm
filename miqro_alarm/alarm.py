@@ -716,12 +716,81 @@ class AlarmGroup:
         )
         self.service.add_handler(self._mqtt_topic("auto/command"), self.handle_auto_msg)
 
+        self.setup_ha_entities()
+
     def __str__(self):
         return self.label
 
     # make this class sortable by priority
     def __lt__(self, other):
         return self.priority < other.priority
+
+    def setup_ha_entities(self):
+        self.ha_device = miqro.ha_sensors.Device(
+            self.service,
+            name=f"Alarm {self.label}",
+        )
+
+        ha_enabled_switch = miqro.ha_sensors.Switch(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/enabled/state",
+            command_topic_postfix=f"{self.name}/enabled/command",
+            name=f"{self.name} enabled",
+            display_name=f"enabled",
+        )
+
+        ha_inhibited_switch = miqro.ha_sensors.Switch(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/inhibited/state",
+            command_topic_postfix=f"{self.name}/inhibited/command",
+            name=f"{self.name} inhibited",
+            display_name=f"inhibited",
+        )
+
+        ha_reset_command = miqro.ha_sensors.Button(
+            device=self.ha_device,
+            command_topic_postfix=f"{self.name}/reset/command",
+            name=f"{self.name} reset",
+            display_name=f"reset",
+        )
+
+        ha_display_state_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/display_state",
+            options=["disabled", "enabled", "inhibited", "prealarm", "alarm"],
+            name=f"{self.name} display state",
+            display_name=f"display state",
+        )
+
+        ha_state_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/state",
+            options=["off", "prealarm", "alarm"],
+            name=f"{self.name} state",
+            display_name=f"state",
+        )
+
+        ha_liveness_sensor = miqro.ha_sensors.BinarySensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/live",
+            name=f"{self.name} all inputs online",
+            display_name=f"all inputs online",
+        )
+
+        ha_auto_button = miqro.ha_sensors.Button(
+            device=self.ha_device,
+            command_topic_postfix=f"{self.name}/auto/command",
+            name=f"{self.name} on/off/reset",
+            display_name=f"on/off/reset",
+            json_attributes_topic_postfix=f"{self.name}/info",
+        )
+
+        ha_active_inputs_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/active_inputs_text",
+            name=f"{self.name} active inputs",
+            display_name=f"active inputs",
+        )
 
     def get_active_inputs_string(self):
         return ", ".join(
@@ -899,6 +968,7 @@ class AlarmGroup:
             "inhibitor": {},
             "liveness": {},
             "label": self.label,
+            "active_inputs_text": self.get_active_inputs_string() or "none",
         }
 
         for category, elements in [
@@ -1056,6 +1126,9 @@ class AlarmService(miqro.Service):
     def publish_info(self):
         data = {group.name: group.get_state() for group in self.groups}
         self.publish_json("info", data, only_if_changed=timedelta(seconds=60))
+        for group in self.groups:
+            data = group.get_state()
+            self.publish_json(f"{group.name}/info", data, only_if_changed=timedelta(seconds=30))
         self.publish_json_keys(data, only_if_changed=True)
 
     @miqro.handle("reset/command")

@@ -57,6 +57,83 @@ The configuration is based on a few concepts:
 
 See (examples/miqro.example.yml)[examples/miqro.example.yml] for configuration examples and explanations.
 
+### Optional Homeassistant Integration
+
+When used with Homeassistant, the service publishes entities for every alarm. Each configured alarm is its own device.
+
+#### Example: Interactive Alarm Overview
+
+Automatically generated overview of all alarms. When clicking an active alarm, it is muted. If the alarm is not active, clicking toggles between enabled/disabled.
+
+This requires the HACS plugins [entity-progress-card](https://github.com/francois-le-ko4la/lovelace-entity-progress-card) and [auto-entities](https://github.com/thomasloven/lovelace-auto-entities).
+
+![Homeassistant tiles showing the alarm status](tiles-alarm-status.png)
+
+```yaml
+type: custom:auto-entities
+filter:
+  include:
+    - options:
+        type: custom:entity-progress-card-template
+        icon: >-
+          {{ {'enabled': 'mdi:alarm-light-outline', 'disabled':
+          'mdi:alarm-light-off-outline', 'prealarm': 'mdi:alarm-light', 'alarm':
+          'mdi:alarm-light', 'inhibited':
+          'mdi:alarm-light-off'}[state_attr('this.entity_id', 'display_state')]
+          }}
+        name: "{{device_attr('this.entity_id', 'name')[6:]}}"
+        secondary: "{{ state_attr('this.entity_id', 'display_state') }}"
+        force_circular_background: true
+        color: >-
+          {{ {'enabled': 'green', 'disabled': 'grey', 'prealarm': 'orange',
+          'alarm': 'red', 'inhibited': 'purple'}[state_attr('this.entity_id',
+          'display_state')] }}
+        bar_color: red
+        bar_effect: shimmer
+        hide: progress_bar
+        icon_tap_action:
+          action: perform-action
+          perform_action: button.press
+          target:
+            entity_id: this.entity_id
+      device: Alarm*
+      entity_id: button.*_on_off_reset
+show_empty: true
+card:
+  type: grid
+  square: false
+card_param: cards
+```
+
+To show only active alarms, add the following (same indentation level as "device").
+
+```yaml
+      attributes:
+        display_state: alarm
+```
+
+#### Example: Overview of Active Inputs
+
+```markdown
+type: markdown
+content: >-
+  {% for x in states | selectattr('entity_id', 'match',
+  'sensor.*_active_inputs') %}
+
+  {% if x.state != 'none' %}
+
+  ### {{ x.name }}
+
+  {% for z in x.state.split(', ') %}
+    * {{ z }}
+  {% endfor %}
+
+  {% endif %}
+
+  {% endfor %}
+
+```
+
 ### MQTT Topics
 
 #### :outbox_tray: Published Topics 
