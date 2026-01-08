@@ -1,6 +1,6 @@
 [project]
 name = "miqro-alarm"
-version = "0.2.3"
+version = "0.3.0"
 description = "A universal alarm service using MQTT as input and output."
 authors = [{name = "Daniel Fett", email = "fett@danielfett.de"}]
 readme = "README.md"
