@@ -1125,11 +1125,11 @@ class AlarmService(miqro.Service):
 
     def publish_info(self):
         data = {group.name: group.get_state() for group in self.groups}
+        self.publish_json_keys(data, only_if_changed=True)
         self.publish_json("info", data, only_if_changed=timedelta(seconds=60))
         for group in self.groups:
             data = group.get_state()
             self.publish_json(f"{group.name}/info", data, only_if_changed=timedelta(seconds=30))
-        self.publish_json_keys(data, only_if_changed=True)
 
     @miqro.handle("reset/command")
     def handle_reset_command(self, _, msg):
