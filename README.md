@@ -57,6 +57,36 @@ The configuration is based on a few concepts:
 
 See (examples/miqro.example.yml)[examples/miqro.example.yml] for configuration examples and explanations.
 
+### Reliability behaviour
+
+Some deliberate choices about what happens when things go wrong:
+
+ * **The configuration is validated at startup.** A group whose outputs reference a
+   schedule that does not define a message for the relevant state, an unknown
+   output name, a misspelled `prealarm`/`alarm` key, or a group with no inputs or
+   no outputs all cause the service to refuse to start. Previously these surfaced
+   as an exception at the moment the alarm fired, or not at all.
+ * **Inhibition fails open.** An inhibitor only suppresses an alarm while it is
+   online. An inhibitor whose last reading was "active" but which has since
+   stopped reporting is ignored, and a warning is sent, so a dead presence sensor
+   cannot silently disarm the alarm.
+ * **Inputs must be understood to count as online.** If an input's `when`
+   expression cannot be evaluated for a payload, the input goes to
+   `invalid_response` rather than staying `online`, so a sensor emitting
+   unexpected values shows up in `all_inputs_online`.
+ * **Alarm state survives a restart.** An active alarm or prealarm is persisted
+   and re-asserted on startup, including re-sending the outputs and resuming a
+   prealarm's escalation timer.
+ * **A triggered input that goes offline holds the alarm.** Auto-reset via
+   `reset_delay` requires inputs to actually report as clear; an input that stops
+   reporting while triggered does not release the alarm.
+ * **`silence_timeout` defaults to 6 hours** if not specified. Set it explicitly
+   per input, or to `null` to disable silence detection for inputs that only
+   report on change.
+ * **The `probe` output only fires while the service is healthy.** If the broker
+   connection is down or the MQTT thread has died, the probe stops, so an external
+   dead-man's switch expires instead of reporting a service that cannot work.
+
 ### Optional Homeassistant Integration
 
 When used with Homeassistant, the service publishes entities for every alarm. Each configured alarm is its own device.
@@ -164,6 +194,16 @@ Same for each inhibitor (`../inhibitor/..`) and liveness check (`../liveness/..`
 
 All outputs listed above are also published in a JSON object at `service/alarm/GROUP1/info`.
 
+**Service health:**
+
+ * `service/alarm/online` — `1` while the service is connected; set to `0` by the broker's last-will if it dies
+
+ * `service/alarm/health/ok` — `1` while the service is connected *and* its MQTT network thread is alive. Prefer this over `online` for monitoring: `online` only proves a process holds the connection.
+
+ * `service/alarm/health/failures` — count of problems that were caught and logged rather than crashing the service (failed publishes, handler exceptions, state save errors). A rising number means the service is degraded even though it is still running.
+
+ * `service/alarm/health/last_failure` — description of the most recent such problem
+
 #### :inbox_tray: Subscribed Topics
 
 The following topics can be used to control the alarm groups:
@@ -175,5 +215,11 @@ The following topics can be used to control the alarm groups:
 
  * `service/alarm/GROUP1/reset/command` — send `1` to reset the alarm when it is active (in `alarm` or `prealarm` state)
 
- * `service/alarm/GROUP1/reset/auto/command` — send `1` to reset the alarm, if it is in `alarm` or `prealarm` state; otherwise, the alarm is disabled or enabled — this is to be used in user interfaces
+ * `service/alarm/GROUP1/auto/command` — send `1` to reset the alarm, if it is in `alarm` or `prealarm` state; otherwise, the alarm is disabled or enabled — this is to be used in user interfaces
+
+ * `service/alarm/reset/command` — send `1` to reset *every* alarm group at once
+
+ * `service/alarm/test/command` — send `1` to run an output self-test: a clearly marked test message is sent to every text output, and the result is published to `service/alarm/test/result`. Use this to verify that notification paths still work without waiting for a real alarm.
+
+Note that `inhibited/command` accepts the same on/off spellings as the other command topics (`1`, `on`, `true`, …), or a number of seconds to inhibit for (`120` inhibits for two minutes). A plain `1` inhibits for the default of 30 minutes.
 

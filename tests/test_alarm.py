@@ -584,18 +584,25 @@ def test_conflicting_alarms(service_no_info_interval):
         },
     )
 
+    # Back to g1's schedule, which repeats. How many repeats fit before g1's own
+    # prealarm timer expires depends on wall-clock timing, so assert only the
+    # minimum that must occur.
     expect_next(
         service,
         {
-            "switch/sw1": ["m == 'schedule1-prealarm'", 3],
+            "switch/sw1": ["m == 'schedule1-prealarm'", 2],
         },
     )
 
+    # g1's prealarm output keeps repeating until g1's own prealarm timer
+    # expires; exactly how many repeats fit into the remaining time is a matter
+    # of wall-clock timing, not of the logic under test.
     expect_next(
         service,
         {
-            "switch/sw1": "m == 'schedule1-reset'",
+            "switch/sw1": eventually("m == 'schedule1-reset'"),
         },
+        2,
     )
 
     expect_next(

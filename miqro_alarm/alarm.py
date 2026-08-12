@@ -4,9 +4,13 @@ from typing import Optional, Dict, List, Tuple, Union
 from datetime import timedelta, datetime
 from enum import Enum
 from dataclasses import dataclass, field
-from heapq import heappush
 from humanfriendly import format_timespan
 from json import loads
+
+
+# Distinguishes "the configuration did not mention this" from an explicit null,
+# which for a timeout means "disable it".
+_UNSET = object()
 
 
 class SwitchOutput:
@@ -16,7 +20,15 @@ class SwitchOutput:
     mqtt: Optional[str]
     http_post: Optional[str]
 
-    def __init__(self, service, mqtt=None, message=None, http_post=None, repeat=None):
+    def __init__(
+        self,
+        service,
+        mqtt=None,
+        message=None,
+        http_post=None,
+        repeat=None,
+        health_check=None,
+    ):
         if mqtt and not message:
             raise Exception("mqtt is set but message is not")
 
@@ -25,19 +37,33 @@ class SwitchOutput:
         self.message = message
         self.http_post = http_post
         self.repeat = repeat
+        # Optional predicate that must hold for this output to fire.  Used by
+        # the liveness probe so that it cannot report health it cannot vouch for.
+        self.health_check = health_check
 
         if self.repeat:
             self.loop = miqro.Loop(self._send, timedelta(**self.repeat), False)
             self.service.add_loop(self.loop)
 
     def _send(self, _=None):
+        if self.health_check is not None and not self.health_check():
+            return
+
         if self.mqtt and self.message:
-            self.service.publish(self.mqtt, self.message, global_=True)
+            # Alarm outputs are worth a redelivery attempt: at QoS 0 a message
+            # published during a broker blip is discarded without a trace.
+            self.service.publish(self.mqtt, self.message, qos=1, global_=True)
         if self.http_post:
-            try:
-                requests.post(self.http_post, timeout=10)
-            except Exception as e:
-                self.service.log.error(f"Error posting to {self.http_post}: {e}")
+            self._post()
+
+    def _post(self):
+        # Short connect timeout: this runs on the loop thread, and every second
+        # spent here is a second the prealarm-to-alarm timer does not advance.
+        try:
+            requests.post(self.http_post, timeout=(3.05, 5))
+        except Exception as e:
+            self.service.log.error(f"Error posting to {self.http_post}: {e}")
+            self.service.note_failure(f"HTTP post to {self.http_post} failed: {e!r}")
 
     def on(self):
         if self.repeat:
@@ -92,20 +118,52 @@ class SwitchOutputGroup:
                 self.resets[name] = SwitchOutput(service, **s["reset"])
             self.schedules[name] = schedule
 
+    def has_output_for(self, schedule: Optional[str], state: AlarmState) -> bool:
+        return schedule in self.schedules and state in self.schedules[schedule]
+
     def _switch_off(self):
         if self.state == AlarmState.OFF:
             return
-        assert self.current_schedule
-        self.schedules[self.current_schedule][self.state].off()
+
+        if self.current_schedule is None:
+            self.service.log.error(
+                f"Output {self} | In state {self.state} with no current schedule; "
+                f"forcing to OFF"
+            )
+            self.state = AlarmState.OFF
+            return
+
+        output = self.schedules.get(self.current_schedule, {}).get(self.state)
+        if output is None:
+            self.service.log.error(
+                f"Output {self} | No '{self.state.name.lower()}' output defined for "
+                f"schedule '{self.current_schedule}'; cannot switch it off"
+            )
+        else:
+            output.off()
+
         if self.current_schedule in self.resets:
             self.resets[self.current_schedule].on()
         self.state = AlarmState.OFF
 
     def _switch_on(self, target: AlarmRequest):
-        assert target.schedule
+        if target.schedule is None:
+            self.service.log.error(f"Output {self} | Request without a schedule ignored")
+            return
+
+        output = self.schedules.get(target.schedule, {}).get(target.state)
+        if output is None:
+            # Should have been caught by validation at startup; refuse loudly
+            # rather than raising out of the middle of the alarm path.
+            self.service.warning(
+                f"Output {self} | No '{target.state.name.lower()}' output defined for "
+                f"schedule '{target.schedule}' -- THIS ALARM PRODUCES NO OUTPUT"
+            )
+            return
+
         if self.current_schedule and self.current_schedule in self.resets:
             self.resets[self.current_schedule].off()
-        self.schedules[target.schedule][target.state].on()
+        output.on()
         self.current_schedule = target.schedule
         self.state = target.state
 
@@ -113,23 +171,27 @@ class SwitchOutputGroup:
         self.service.log.info(
             f"Output {self} | Request {group.state} for group: {group}"
         )
-        for request in self.requests:
-            if request.group == group:
-                del self.requests[self.requests.index(request)]
+
+        # Rebuild rather than deleting in place: the list was maintained as a
+        # heap, and removing at an arbitrary index breaks the heap invariant, so
+        # requests[0] was no longer necessarily the highest-priority request.
+        # Deleting while iterating also skipped entries.
+        self.requests = [r for r in self.requests if r.group is not group]
 
         if group.state != AlarmState.OFF:
-            heappush(self.requests, AlarmRequest(group, group.state, schedule))
+            self.requests.append(AlarmRequest(group, group.state, schedule))
 
         if len(self.requests) == 0:
             self.service.log.info(f"Output {self} | No requests, setting state to OFF")
             self._switch_off()
             return
 
-        target = self.requests[0]
+        target = min(self.requests)
 
         if self.current_schedule == target.schedule and self.state == target.state:
             self.service.log.info(
-                f"Output {self} | Request {state.name} for group: {group} ignored, already in state: {self.state}"
+                f"Output {self} | Request {group.state.name} for group: {group} "
+                f"ignored, already in state: {self.state}"
             )
             return
 
@@ -155,12 +217,12 @@ class TextOutput:
 
     def add_group(self, group: "AlarmGroup"):
         if not group in self.groups:
-            heappush(self.groups, group)
+            self.groups.append(group)
+            # Sorted, not heapified: the order groups appear in a message should
+            # be by priority, and a heap only guarantees its first element.
+            self.groups.sort()
 
     def update(self, update_reason: "UpdateReason"):
-        # TODO:
-        # The text output needs no update if no alarm is active any longer in case it is an "alarm" or "prealarm" group output.
-        # The text output should send a "reset" message if no alarm is active any longer in case it is a "reset" group output.
         alarm_information = {
             group.label: self._get_group_information(group)
             for group in self.groups
@@ -171,12 +233,27 @@ class TextOutput:
             f"TextOutput {self} | Alarm information: {alarm_information}"
         )
 
-        if alarm_information != self.published_alarm_information:
+        if alarm_information == self.published_alarm_information:
+            return
+
+        message = self._format_msg(alarm_information, update_reason)
+
+        if not message:
+            # Nothing is active any more.  Publishing the empty string would
+            # send an empty SMS through a text gateway.
             self.published_alarm_information = alarm_information
-            self.service.publish(
-                self.mqtt,
-                self._format_msg(alarm_information, update_reason),
-                global_=True,
+            return
+
+        info = self.service.publish(self.mqtt, message, qos=1, global_=True)
+
+        # Only remember what was published once it actually was: otherwise a
+        # failed publish is recorded as delivered and the alarm text is never
+        # retried, so the message is lost for good.
+        if info is not None and getattr(info, "rc", 0) == 0:
+            self.published_alarm_information = alarm_information
+        else:
+            self.service.log.error(
+                f"TextOutput {self} | Publishing alarm text failed; will retry"
             )
 
     def send_info(self, message):
@@ -275,6 +352,10 @@ class Input:
 
     def get_state(self):
         return self.state
+
+    def is_live(self):
+        """Whether this input's value can currently be trusted."""
+        return self.get_state() == InputState.ONLINE
 
     def __str__(self):
         return self.label
@@ -401,6 +482,12 @@ class MQTTInput(Input):
     condition: str
     format: Optional[str]
 
+    # Applied when the configuration does not mention silence_timeout at all.
+    # Kept short deliberately: an input that is allowed to stay quiet for days
+    # can be dead for days before anyone is told, so a long window has to be an
+    # explicit per-input decision.
+    DEFAULT_SILENCE_TIMEOUT: Dict = {"hours": 6}
+
     silence_timeout_check_loop: Optional[miqro.Loop] = None
 
     last_raw_value: Optional[str] = None
@@ -415,7 +502,7 @@ class MQTTInput(Input):
         label,
         debounce=None,
         format=None,
-        silence_timeout: Optional[Dict] = {"days": 7},
+        silence_timeout: Union[Dict, None, object] = _UNSET,
     ):
         super().__init__(service, group, label, debounce)
         self.mqtt = mqtt
@@ -424,9 +511,16 @@ class MQTTInput(Input):
 
         self.service.add_global_handler(self.mqtt, self.handle)
 
-        if silence_timeout is not None:
+        if silence_timeout is _UNSET:
+            silence_timeout = self.DEFAULT_SILENCE_TIMEOUT
+
+        self.silence_timeout: Optional[timedelta] = (
+            timedelta(**silence_timeout) if silence_timeout is not None else None
+        )
+
+        if self.silence_timeout is not None:
             self.silence_timeout_check_loop = miqro.Loop(
-                self._check_silence_timeout, timedelta(**silence_timeout), False
+                self._check_silence_timeout, self.silence_timeout, False
             )
             self.service.add_loop(self.silence_timeout_check_loop)
             self.silence_timeout_check_loop.start(delayed=True)
@@ -439,14 +533,15 @@ class MQTTInput(Input):
         self.service.add_loop(self.store_state_loop)
         self.store_state_loop.start(delayed=True)
 
-    def handle(self, _, raw_value):
-        self.last_update = datetime.now()
-        self.last_raw_value = raw_value
-        if self.silence_timeout_check_loop:
-            self.silence_timeout_check_loop.restart(delayed=True)
-        self.state = InputState.ONLINE
+    def _evaluate(self, raw_value):
+        """Evaluate the input's condition against a payload.
+
+        Returns ``(ok, value)``.  Never raises: a sensor that starts sending
+        payloads the condition cannot handle must not be able to take down the
+        service that is watching it.
+        """
         try:
-            new_eval_value = eval(
+            return True, eval(
                 self.condition,
                 {
                     "value": raw_value,
@@ -457,10 +552,25 @@ class MQTTInput(Input):
                 },
             )
         except Exception as e:
-            self.service.warning(
-                f"Group {self.group}, input {self} | Evaluation of input '{raw_value}' failed: {e}"
+            self.service.warning_throttled(
+                f"{self.mqtt}:eval",
+                f"Group {self.group}, input {self} | Evaluation of input "
+                f"'{raw_value}' failed: {e}",
             )
-            new_eval_value = self.last_eval_value
+            return False, self.last_eval_value
+
+    def handle(self, _, raw_value):
+        self.last_update = datetime.now()
+        self.last_raw_value = raw_value
+        if self.silence_timeout_check_loop:
+            self.silence_timeout_check_loop.restart(delayed=True)
+
+        ok, new_eval_value = self._evaluate(raw_value)
+
+        # Only count as online once the payload could actually be interpreted.
+        # Marking it online first meant a sensor emitting values the condition
+        # cannot handle still reported healthy while being functionally dead.
+        self.state = InputState.ONLINE if ok else InputState.INVALID_RESPONSE
 
         self._handle_change(new_eval_value)
         self._store_state()
@@ -523,11 +633,47 @@ class MQTTInput(Input):
         stored_state = self.service.state.get_path(
             "mqtt_input", self.mqtt, self.condition, "last_state", default=None
         )
-        if stored_state is not None:
+        if stored_state is None:
+            return
+
+        try:
             self.last_raw_value = stored_state["last_raw_value"]
             self.last_eval_value = stored_state["last_eval_value"]
             self.last_update = stored_state["last_update"]
             self.state = InputState(stored_state["state"])
+        except (KeyError, TypeError, ValueError) as e:
+            self.service.log.error(
+                f"Group {self.group}, input {self} | Ignoring unusable stored "
+                f"state ({e!r})"
+            )
+            return
+
+        # Restoring the state avoids reporting every change-only sensor as
+        # offline after a restart -- but it must not launder stale data into
+        # looking fresh.  If the stored reading is already older than the
+        # silence timeout, the input is offline right now, and the timeout check
+        # is scheduled for when it actually falls due rather than a full fresh
+        # window from boot.
+        if self.silence_timeout is None:
+            return
+
+        if self.last_update is None:
+            self.state = InputState.OFFLINE
+            return
+
+        age = datetime.now() - self.last_update
+        if age >= self.silence_timeout:
+            self.service.log.warning(
+                f"Group {self.group}, input {self} | Stored reading is "
+                f"{format_timespan(age)} old (silence timeout "
+                f"{format_timespan(self.silence_timeout)}); treating as offline"
+            )
+            self.state = InputState.OFFLINE
+        elif self.silence_timeout_check_loop is not None:
+            remaining = self.silence_timeout - age
+            self.silence_timeout_check_loop.interval = remaining
+            self.silence_timeout_check_loop.start(delayed=True)
+            self.silence_timeout_check_loop.interval = self.silence_timeout
 
 
 class LivenessInput(MQTTInput):
@@ -553,10 +699,10 @@ class LivenessInput(MQTTInput):
             silence_timeout=silence_timeout,
         )
         self.invalid_response_timeout = timedelta(**invalid_response_timeout)
-        # self.invalid_response_timeout_check_loop = miqro.Loop(
-        #    self.check_invalid_response_timeout, self.invalid_response_timeout, False
-        # )
-        # self.service.add_loop(self.invalid_response_timeout_check_loop)
+        self.invalid_response_timeout_check_loop = miqro.Loop(
+            self.check_invalid_response_timeout, self.invalid_response_timeout, False
+        )
+        self.service.add_loop(self.invalid_response_timeout_check_loop)
 
     def handle(self, _, raw_value):
         self.last_update = datetime.now()
@@ -565,23 +711,22 @@ class LivenessInput(MQTTInput):
         if self.silence_timeout_check_loop:
             self.silence_timeout_check_loop.restart(delayed=True)
 
-        self._handle_change(
-            eval(
-                self.condition,
-                {
-                    "value": raw_value,
-                    "value_float": self.try_float(raw_value),
-                    "value_json": self.try_json(raw_value),
-                    "is_on": is_on,
-                    "is_off": is_off,
-                },
-            )
-        )
+        # A liveness check watches something that may itself be malfunctioning,
+        # so an unparseable payload is an expected input here, not a bug.  It
+        # counts as an invalid response rather than propagating.
+        ok, new_eval_value = self._evaluate(raw_value)
+        if not ok:
+            new_eval_value = False
 
-    # def check_invalid_response_timeout(self, _):
-    #    self.service.warning(
-    #        f"Group {self.group}, liveness input {self}: Invalid response since {self.last_update}"
-    #    )
+        self._handle_change(new_eval_value)
+        self._store_state()
+
+    def check_invalid_response_timeout(self, _):
+        self.service.warning(
+            f"Group {self.group}, liveness input {self}: Invalid response "
+            f"({self.last_raw_value}) since {self.last_update}!"
+        )
+        return False  # one warning per episode
 
     def _handle_change(self, new_eval_value):
         if new_eval_value == self.last_eval_value:
@@ -594,13 +739,13 @@ class LivenessInput(MQTTInput):
 
         if new_eval_value:
             self.state = InputState.ONLINE
-            # self.invalid_response_timeout_check_loop.stop()
+            self.invalid_response_timeout_check_loop.stop()
         else:
             self.state = InputState.INVALID_RESPONSE
-            # self.invalid_response_timeout_check_loop.start(delayed=True)
-            self.service.warning(
-                f"Group {self.group}, liveness input {self}: Invalid response ({self.last_raw_value})!"
-            )
+            # Warn only once the response has been invalid for the configured
+            # grace period, so that a single transient bad reading does not page
+            # anyone -- this loop was configured but never armed.
+            self.invalid_response_timeout_check_loop.start(delayed=True)
 
         return True
 
@@ -656,16 +801,30 @@ class AlarmGroup:
         self.service.log.debug(f"Assigning outputs for group {self}")
         self.text_outputs = {}
         self.switch_outputs = {}
+        self.configured_output_types = list(outputs.keys())
         for alarm_type, outs in outputs.items():
             self.text_outputs[alarm_type] = []
             self.switch_outputs[alarm_type] = []
-            for o in outs:
+            for o in outs or []:
                 if type(o) is dict:
                     # output description is of the form 'output_name: schedule'
-                    output_name, schedule = o.popitem()
+                    # Read without mutating: popitem() empties the dict, and YAML
+                    # anchors mean the same dict can be shared between groups.
+                    if len(o) != 1:
+                        raise Exception(
+                            f"Group '{name}': output entry {o!r} must map exactly one "
+                            f"output name to one schedule"
+                        )
+                    output_name, schedule = next(iter(o.items()))
+                    if output_name not in self.service.switch_outputs:
+                        raise Exception(
+                            f"Group '{name}': unknown switch output '{output_name}'"
+                        )
                     output = self.service.switch_outputs[output_name]
                     self.switch_outputs[alarm_type].append((output, schedule))
                 else:
+                    if o not in self.service.text_outputs:
+                        raise Exception(f"Group '{name}': unknown text output '{o}'")
                     output = self.service.text_outputs[o]
                     output.add_group(self)
                     self.text_outputs[alarm_type].append(output)
@@ -801,17 +960,38 @@ class AlarmGroup:
             ]
         )
 
+    def any_inhibitor_active(self):
+        """Whether an inhibitor is currently, verifiably suppressing this group.
+
+        Only inhibitors that are live count.  Using the last known value
+        regardless of state means an inhibitor that died while reading "true" --
+        a presence sensor that lost power, or a value restored from the state
+        file after a restart -- suppresses the alarm indefinitely, silently.
+        Inhibition fails open.
+        """
+        for inhibitor in self.inhibitors:
+            if not inhibitor.get_last_value():
+                continue
+            if inhibitor.is_live():
+                return True
+            self.service.warning_throttled(
+                f"{self.name}:stale-inhibitor:{inhibitor.label}",
+                f"{self} | Inhibitor '{inhibitor}' reads active but is "
+                f"{inhibitor.get_state().name.lower()}; ignoring it so the alarm "
+                f"stays armed",
+            )
+        return False
+
     def on(self, input):
         self.update_sensor_stream(input)
         self.service.log.info(f" {self} | {input} is on, from state: {self.state}")
 
         if input in self.inhibitors:
-            if self.state == AlarmState.PREALARM:
+            if self.state == AlarmState.PREALARM and self.any_inhibitor_active():
                 self.do_reset(input)
             return
 
-        if self.reset_delay:
-            assert self.alarm_to_reset_loop
+        if self.reset_delay and self.alarm_to_reset_loop:
             self.alarm_to_reset_loop.stop()
 
         if not self.enabled:
@@ -822,7 +1002,7 @@ class AlarmGroup:
             self.service.log.info(f"{self} is inhibited by command, ignoring")
             return
 
-        if any(i.get_last_value() for i in self.inhibitors):
+        if self.any_inhibitor_active():
             self.service.log.info(f"{self} is inhibited by inhibitor, ignoring")
             return
 
@@ -839,17 +1019,29 @@ class AlarmGroup:
         self.service.log.info(f" {self} | {input} is off, from state: {self.state}")
 
         if not self.reset_delay:  # never reset this alarm automatically
-            # self.update_outputs(UpdateReason.UPDATE_ALARM)
             return
 
-        assert self.alarm_to_reset_loop
+        if not self.alarm_to_reset_loop:
+            return
 
-        input_states_off_or_invalid = (
-            (i.get_state() != InputState.ONLINE or i.get_last_value() == False)
-            for i in self.inputs
-        )
+        # An input counts as clear when its last known reading was not
+        # triggered.  Previously a *triggered* input that went offline also
+        # counted as clear, so an input dying mid-alarm released the alarm --
+        # which is exactly what cutting power to a sensor looks like.  An input
+        # that has never reported at all still counts as clear, since it is not
+        # holding anything.
+        def is_clear(i):
+            if not i.get_last_value():
+                return True
+            if not i.is_live():
+                self.service.warning_throttled(
+                    f"{self.name}:stale-input:{i.label}",
+                    f"{self} | Input '{i}' went {i.get_state().name.lower()} while "
+                    f"reading active; holding the alarm rather than resetting it",
+                )
+            return False
 
-        if all(input_states_off_or_invalid):
+        if all(is_clear(i) for i in self.inputs):
             self.service.log.info(f"Starting timeout for alarm reset")
             self.alarm_to_reset_loop.start(delayed=True)
 
@@ -861,28 +1053,35 @@ class AlarmGroup:
         self.service.log.info(
             f">> {self} | Prealarm triggered by {type(trigger)} '{trigger}', from state: {self.state}"
         )
-        assert self.state != AlarmState.PREALARM
+        if self.state == AlarmState.PREALARM:
+            self.service.log.warning(f"{self} | Already in prealarm; ignoring")
+            return
 
         self.state = AlarmState.PREALARM
+        self._persist_state()
         self.update_outputs(UpdateReason.SWITCH_TO_PREALARM)
         self.service.request_publish_info()
 
-        if self.prealarm:
-            assert self.prealarm_to_alarm_loop
+        if self.prealarm_to_alarm_loop:
             self.prealarm_to_alarm_loop.start(delayed=True)
 
     def do_alarm(self, trigger):
         self.service.log.info(
             f">> {self} | Alarm triggered by {type(trigger)} '{trigger}', from state: {self.state}"
         )
-        assert self.state != AlarmState.ALARM
+        # Not an assertion: two threads or a timer racing a command must not be
+        # able to abort the alarm path, and under `python -O` an assert would
+        # vanish and let it continue into a state it was written to reject.
+        if self.state == AlarmState.ALARM:
+            self.service.log.warning(f"{self} | Already in alarm; ignoring")
+            return False
 
         self.state = AlarmState.ALARM
+        self._persist_state()
         self.update_outputs(UpdateReason.SWITCH_TO_ALARM)
         self.service.request_publish_info()
 
-        if self.prealarm:
-            assert self.prealarm_to_alarm_loop
+        if self.prealarm_to_alarm_loop:
             self.prealarm_to_alarm_loop.stop()
         return False  # stop the reset loop if triggered from there
 
@@ -890,21 +1089,63 @@ class AlarmGroup:
         self.service.log.info(
             f">> {self} | Reset triggered by {type(trigger)} '{trigger}', from state: {self.state}"
         )
-        assert self.state in [AlarmState.ALARM, AlarmState.PREALARM]
+        if self.state not in [AlarmState.ALARM, AlarmState.PREALARM]:
+            self.service.log.info(f"{self} | Not active; nothing to reset")
+            return False
 
         self.state = AlarmState.OFF
+        self._persist_state()
         self.reset_outputs()
         self.service.request_publish_info()
 
-        if self.prealarm:
-            assert self.prealarm_to_alarm_loop
+        if self.prealarm_to_alarm_loop:
             self.prealarm_to_alarm_loop.stop()
 
-        if self.reset_delay:  # never reset this alarm automatically
-            assert self.alarm_to_reset_loop
+        if self.alarm_to_reset_loop:
             self.alarm_to_reset_loop.stop()
 
         return False  # stop the reset loop if triggered from there
+
+    def _persist_state(self):
+        """Record the alarm state so it survives a restart.
+
+        Without this, a crash or a package upgrade during an active alarm turned
+        it off silently: the state lived only in memory, no reset was ever sent
+        to the outputs, and a still-triggered input would not re-fire because its
+        restored value was unchanged.
+        """
+        assert self.service.state
+        self.service.state.set_path("group_state", self.name, value=self.state.name)
+        self.service.state.save()
+
+    def _restore_state(self):
+        assert self.service.state
+        stored = self.service.state.get_path("group_state", self.name, default=None)
+        if stored is None:
+            return
+
+        try:
+            state = AlarmState[stored]
+        except KeyError:
+            self.service.log.error(f"{self} | Ignoring unknown stored state {stored!r}")
+            return
+
+        if state == AlarmState.OFF:
+            return
+
+        self.service.warning(
+            f"{self} | Restoring {state.name} state that was active before the "
+            f"restart; re-asserting outputs"
+        )
+        self.state = state
+        self.update_outputs(
+            UpdateReason.SWITCH_TO_ALARM
+            if state == AlarmState.ALARM
+            else UpdateReason.SWITCH_TO_PREALARM
+        )
+        # An interrupted prealarm still has to escalate.
+        if state == AlarmState.PREALARM and self.prealarm_to_alarm_loop:
+            self.prealarm_to_alarm_loop.start(delayed=True)
 
     def update_outputs(self, update_reason: UpdateReason):
         for output, schedule in self.switch_outputs.get(self.state.name.lower(), []):
@@ -940,12 +1181,12 @@ class AlarmGroup:
     def get_state(self):
         self.service.log.debug(f"{self} | Assembling state")
 
+        inhibited = self.inhibited_by_command or self.any_inhibitor_active()
+
         if not self.enabled:
             display_state = "disabled"
         else:
-            if self.inhibited_by_command or any(
-                i.get_last_value() for i in self.inhibitors
-            ):
+            if inhibited:
                 display_state = "inhibited"
             else:
                 display_state = "enabled"
@@ -959,8 +1200,7 @@ class AlarmGroup:
             "all_inputs_online": self.all_ok(),
             "enabled/state": self.enabled,
             "inhibited/state": self.inhibited_by_command,
-            "any_inhibitor_active": self.inhibited_by_command
-            or any(i.get_last_value() for i in self.inhibitors),
+            "any_inhibitor_active": inhibited,
             "state": self.state.name.lower(),
             "display_state": display_state,
             "live": live,
@@ -996,17 +1236,46 @@ class AlarmGroup:
         self.service.log.info(f"{self} | Enabled: {self.enabled}")
         self.service.request_publish_info()
 
+    # Applied when an inhibit command does not name a duration.
+    DEFAULT_INHIBIT_TIMEOUT = timedelta(minutes=30)
+
     def handle_inhibit_msg(self, _, msg):
-        self.inhibited_by_command = msg.isnumeric() and int(msg) > 0
+        """Handle an inhibit command.
 
-        if self.inhibited_by_command and self.state == AlarmState.PREALARM:
-            self.do_reset("MQTT message, inhibited=1")
+        Accepts the same on/off spellings as every other command ("1", "on",
+        "true", ...), or a number of seconds to inhibit for.  Previously the
+        payload was both at once: "1" meant "inhibit" *and* "for one second", so
+        the Home Assistant switch -- which sends "1" -- inhibited the group for
+        exactly one second and then silently released it.
+        """
+        duration = None
+        if msg.isnumeric():
+            seconds = int(msg)
+            inhibit = seconds > 0
+            # Treat a bare "1" as a plain "on" rather than a one-second inhibit.
+            if seconds > 1:
+                duration = timedelta(seconds=min(seconds, 86400))
+        else:
+            inhibit = is_on(msg)
 
-        if self.inhibited_by_command:
-            self.inhibit_timeout_loop.interval = timedelta(seconds=int(msg))
+        self.inhibited_by_command = inhibit
+
+        if inhibit:
+            self.inhibit_timeout_loop.interval = duration or self.DEFAULT_INHIBIT_TIMEOUT
             self.inhibit_timeout_loop.start(delayed=True)
+            if self.state == AlarmState.PREALARM:
+                self.do_reset("MQTT message, inhibited=1")
+        else:
+            self.inhibit_timeout_loop.stop()
 
-        self.service.log.info(f"{self} | Inhibited: {self.inhibited_by_command}")
+        self.service.log.info(
+            f"{self} | Inhibited: {self.inhibited_by_command}"
+            + (
+                f" for {format_timespan(self.inhibit_timeout_loop.interval)}"
+                if inhibit
+                else ""
+            )
+        )
         self.service.request_publish_info()
 
     def handle_reset_msg(self, _, msg):
@@ -1055,7 +1324,15 @@ class AlarmService(miqro.Service):
     SERVICE_NAME = "alarm"
     USE_STATE_FILE = True
 
-    probe: Optional[SwitchOutput] = None
+    # An alarm must not miss an input because the broker connection blinked, so
+    # ask the broker to hold messages for us while we are away.
+    CLEAN_SESSION = False
+
+    # Repeated warnings about the same thing are suppressed for this long, so
+    # that a sensor emitting garbage at 10 Hz cannot bury everything else.
+    WARNING_THROTTLE = timedelta(minutes=15)
+
+    probe_output: Optional[SwitchOutput] = None
     text_outputs: Dict[str, TextOutput]
     switch_outputs: Dict[str, SwitchOutputGroup]
     groups: List[AlarmGroup]
@@ -1068,14 +1345,25 @@ class AlarmService(miqro.Service):
         super().__init__(*args, **kwargs)
 
         self.started = datetime.now()
-
-        if self.service_config.get("probe", None):
-            self.log.debug(f"Creating probe output.")
-            self.probe_output = SwitchOutput(self, **self.service_config["probe"])
-            self.probe_output.on()
+        self._warning_sent_at: Dict[str, datetime] = {}
 
         self.create_outputs()
         self.create_alarm_groups()
+        self.validate_configuration()
+
+        # Restore alarms that were active before the restart only once
+        # everything they drive exists.
+        for group in self.groups:
+            group._restore_state()
+
+        # Created last: the probe tells an external watchdog that this service
+        # is working, so it must not start reporting that until it is.
+        if self.service_config.get("probe", None):
+            self.log.debug(f"Creating probe output.")
+            self.probe_output = SwitchOutput(
+                self, **self.service_config["probe"], health_check=self.probe_healthy
+            )
+            self.probe_output.on()
 
     def create_outputs(self):
         self.text_outputs = {}
@@ -1088,24 +1376,118 @@ class AlarmService(miqro.Service):
             self.log.debug(f"Creating switch output: {name}")
             self.switch_outputs[name] = SwitchOutputGroup(self, **config)
 
+    def validate_configuration(self):
+        """Reject a configuration that cannot drive its outputs.
+
+        Every one of these problems used to surface as a KeyError or an empty
+        lookup at the moment an alarm fired -- months after deployment, in the
+        one code path nobody wants to debug live -- or not at all.  A startup
+        failure is visible; a silent alarm is not.
+        """
+        problems: List[str] = []
+
+        for group in self.groups:
+            for alarm_type in group.configured_output_types:
+                if alarm_type not in ("prealarm", "alarm"):
+                    problems.append(
+                        f"group '{group.name}': unknown output type "
+                        f"'{alarm_type}' (expected 'prealarm' or 'alarm')"
+                    )
+
+            if group.prealarm and not group.switch_outputs.get("alarm") and not group.text_outputs.get("alarm"):
+                problems.append(
+                    f"group '{group.name}': has a prealarm but no 'alarm' outputs, "
+                    f"so escalating can never do anything"
+                )
+
+            if not any(group.switch_outputs.values()) and not any(
+                group.text_outputs.values()
+            ):
+                problems.append(f"group '{group.name}': has no outputs at all")
+
+            if not group.inputs:
+                problems.append(f"group '{group.name}': has no inputs")
+
+            for alarm_type, outputs in group.switch_outputs.items():
+                if alarm_type not in ("prealarm", "alarm"):
+                    continue
+                state = (
+                    AlarmState.PREALARM if alarm_type == "prealarm" else AlarmState.ALARM
+                )
+                for output, schedule in outputs:
+                    if schedule not in output.schedules:
+                        problems.append(
+                            f"group '{group.name}' ({alarm_type}): switch output has "
+                            f"no schedule '{schedule}'"
+                        )
+                    elif not output.has_output_for(schedule, state):
+                        problems.append(
+                            f"group '{group.name}' ({alarm_type}): schedule "
+                            f"'{schedule}' defines no '{alarm_type}' message, so this "
+                            f"alarm would produce no output"
+                        )
+
+        if problems:
+            raise Exception(
+                "Invalid alarm configuration:\n"
+                + "\n".join(f"  - {p}" for p in problems)
+            )
+
+        self.log.info(f"Configuration validated: {len(self.groups)} alarm group(s)")
+
+    def probe_healthy(self) -> bool:
+        """Whether it is honest to tell an external watchdog that we are fine.
+
+        The probe used to fire unconditionally from the main loop, which proved
+        only that the loop was spinning -- it kept reporting healthy with a dead
+        MQTT thread or no broker connection at all, i.e. in exactly the states
+        where the alarm cannot work.
+        """
+        if not self.is_connected:
+            self.log.error("Probe suppressed: not connected to the broker")
+            return False
+        if not self.mqtt_thread_alive():
+            self.log.critical("Probe suppressed: MQTT network thread is dead")
+            return False
+        return True
+
     def warning(self, msg):
         self.log.warning(msg)
         for output in self.text_outputs.values():
             if output.info:
                 output.send_info(msg)
 
+    def warning_throttled(self, key: str, msg: str):
+        """Send a warning at most once per :attr:`WARNING_THROTTLE` per key.
+
+        Used for conditions that repeat per message -- a sensor whose payload
+        the condition cannot evaluate, a stale inhibitor -- where warning every
+        time turns the notification channel into noise and hides everything
+        else.
+        """
+        now = datetime.now()
+        last = self._warning_sent_at.get(key)
+        if last is not None and now - last < self.WARNING_THROTTLE:
+            self.log.debug(f"(throttled) {msg}")
+            return
+        self._warning_sent_at[key] = now
+        self.warning(msg)
+
     def create_alarm_groups(self):
         self.groups = []
         priority = 100
+        if not self.service_config.get("groups"):
+            raise Exception("No alarm groups configured under services.alarm.groups")
+
         for config in self.service_config["groups"]:
             priority += 1
             self.log.debug(f"Creating group: {config['name']}")
 
-            if "priority" in config:
-                the_priority = config["priority"]
-                del config["priority"]
-            else:
-                the_priority = priority
+            # Copy rather than deleting the key: the configuration dict belongs
+            # to the loaded YAML, and mutating it makes construction
+            # non-repeatable.
+            config = dict(config)
+            the_priority = config.pop("priority", priority)
 
             self.groups.append(AlarmGroup(self, priority=the_priority, **config))
 
@@ -1131,14 +1513,56 @@ class AlarmService(miqro.Service):
             data = group.get_state()
             self.publish_json(f"{group.name}/info", data, only_if_changed=timedelta(seconds=30))
 
+    # Note: @miqro.handle registers the undecorated function, so dispatch calls
+    # it as handler(service, payload) -- these take (self, msg), unlike the
+    # bound methods passed to add_handler, which take (self, _, msg).
     @miqro.handle("reset/command")
-    def handle_reset_command(self, _, msg):
+    def handle_reset_command(self, msg):
         for group in self.groups:
-            group.handle_reset_msg(_, msg)
+            group.handle_reset_msg(None, msg)
+
+    @miqro.handle("test/command")
+    def handle_test_command(self, msg):
+        """Exercise the output path without raising a real alarm.
+
+        Without this, the first proof that the sirens and the text gateway still
+        work is a real alarm, which is the worst possible time to discover that
+        a topic changed six months ago.
+        """
+        if not is_on(msg):
+            return
+
+        self.log.info("Running output self-test")
+        results = []
+
+        for name, output in self.text_outputs.items():
+            try:
+                output.send_info(
+                    f"TEST MESSAGE -- alarm service self-test at "
+                    f"{datetime.now():%Y-%m-%d %H:%M:%S}, no action needed"
+                )
+                results.append(f"{name}: sent")
+            except Exception as e:
+                results.append(f"{name}: FAILED ({e!r})")
+                self.note_failure(f"self-test of text output '{name}' failed: {e!r}")
+
+        summary = "; ".join(results) if results else "no text outputs configured"
+        self.log.info(f"Output self-test: {summary}")
+        self.publish("test/result", summary)
 
     @miqro.loop(minutes=5)
     def save_state(self):
-        self.state.save()
+        if self.state:
+            self.state.save()
+
+    @miqro.loop(minutes=5)
+    def report_health(self):
+        """Publish whether the service is working, not merely running."""
+        self.publish("health/ok", self.healthy(), only_if_changed=True)
+        self.publish("health/failures", self.failure_count, only_if_changed=True)
+        self.publish(
+            "health/last_failure", self.last_failure or "none", only_if_changed=True
+        )
 
 
 def run():
