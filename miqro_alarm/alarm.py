@@ -129,7 +129,7 @@ class SwitchOutputGroup:
 
         if self.current_schedule == target.schedule and self.state == target.state:
             self.service.log.info(
-                f"Output {self} | Request {state.name} for group: {group} ignored, already in state: {self.state}"
+                f"Output {self} | Request {target} for group: {group} ignored, already in state: {self.state}"
             )
             return
 
