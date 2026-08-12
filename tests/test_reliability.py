@@ -319,6 +319,110 @@ def test_stale_inhibitor_does_not_suppress_the_alarm(tmp_path):
     expect_next(service, {"out/siren": "m == 'alarm-intrusion'"})
 
 
+def test_multi_input_child_can_log_during_construction(tmp_path):
+    """A half-built MultiInput must be safe to stringify.
+
+    MultiInput builds its children before assigning self.inputs/self.mode, and
+    each child takes the MultiInput as its group.  Any log message emitted while
+    a child is being constructed formats that group -- which crashed startup with
+    AttributeError, taking the whole service down.
+    """
+    import miqro.test.tools as tools
+
+    def multi(alarm):
+        alarm["groups"][0]["inputs"] = [
+            {
+                "label": "Multi",
+                "mode": "or",
+                "inputs": [
+                    {"mqtt": "in/a", "when": "is_on(value)", "label": "A1"},
+                    {"mqtt": "in/b", "when": "is_on(value)", "label": "A2"},
+                ],
+            }
+        ]
+
+    # A stored reading older than the silence timeout makes _load_state warn
+    # while the child is still being constructed.
+    tools.SAVED_STATE.update(
+        {
+            "mqtt_input": {
+                "in/a": {
+                    "is_on(value)": {
+                        "last_state": {
+                            "last_raw_value": "1",
+                            "last_eval_value": True,
+                            "last_update": datetime.now() - timedelta(days=3),
+                            "state": InputState.ONLINE.value,
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    service = make_service(tmp_path, multi, state_cls=DummyState)
+
+    multi_input = service.groups[0].inputs[0]
+    assert str(multi_input) == "Multi (2 inputs, 'or')"
+    # The stale stored reading was not laundered into looking fresh.
+    assert multi_input.inputs[0].get_state() == InputState.OFFLINE
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"last_update": "2026-01-01 10:00:00"},  # a string, not a timestamp
+        {"last_update": 1234567890},  # a number
+        {"state": 99},  # not a valid InputState
+        {},  # missing every key
+        "not a mapping at all",
+    ],
+    ids=["string-date", "numeric-date", "bad-state", "empty", "not-a-mapping"],
+)
+def test_unusable_stored_input_state_does_not_stop_startup(tmp_path, stored):
+    """A hand-edited or version-skewed state file must not prevent startup."""
+    import miqro.test.tools as tools
+
+    if isinstance(stored, dict):
+        entry = {
+            "last_raw_value": "1",
+            "last_eval_value": True,
+            "last_update": datetime.now(),
+            "state": InputState.ONLINE.value,
+        }
+        entry.update(stored)
+    else:
+        entry = stored
+
+    tools.SAVED_STATE.update(
+        {"mqtt_input": {"in/door": {"is_on(value)": {"last_state": entry}}}}
+    )
+
+    # The service starts at all -- this used to be able to raise out of the
+    # constructor, which systemd turns into a restart loop.
+    service = make_service(tmp_path, state_cls=DummyState)
+    assert service.groups[0].state == AlarmState.OFF
+
+    # And the input still works: a genuine change triggers the alarm.
+    send(service, "in/door", "0")
+    send(service, "in/door", "1")
+    expect_next(service, {"out/siren": "m == 'alarm-intrusion'"})
+
+
+def test_multi_input_rejects_a_bad_mode_before_building_children(tmp_path):
+    def bad_mode(alarm):
+        alarm["groups"][0]["inputs"] = [
+            {
+                "label": "Multi",
+                "mode": "xor",
+                "inputs": [{"mqtt": "in/a", "when": "is_on(value)", "label": "A1"}],
+            }
+        ]
+
+    with pytest.raises(Exception, match="must be either 'and' or 'or'"):
+        make_service(tmp_path, bad_mode)
+
+
 def test_alarm_state_survives_a_restart(tmp_path):
     """An active alarm must not disappear when the service restarts."""
     config_path = write_config(tmp_path)

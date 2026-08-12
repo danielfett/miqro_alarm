@@ -442,13 +442,19 @@ class Input:
 class MultiInput(Input):
     def __init__(self, service, group, label, inputs, mode):
         super().__init__(service, group, label)
-        self.inputs = Input.create_from_input_list(service, self, inputs)
+
         if not mode in ["and", "or"]:
             raise Exception(
                 f"For multi input, mode must be either 'and' or 'or', but not '{mode}'"
             )
 
+        # Set before building the children: each child takes this object as its
+        # group, and anything that logs during a child's construction will
+        # stringify it.  Assigning afterwards left a half-built parent visible
+        # to its own children.
         self.mode = mode
+        self.inputs = []
+        self.inputs.extend(Input.create_from_input_list(service, self, inputs))
 
     def get_last_value(self):
         if self.mode == "and":
@@ -474,7 +480,13 @@ class MultiInput(Input):
         self.on(input)
 
     def __str__(self):
-        return f"{self.label} ({len(self.inputs)} inputs, '{self.mode}')"
+        # Tolerate being stringified before construction has finished: this is
+        # reached from log messages emitted while the children are being built,
+        # and a broken __str__ there turns a log line into a startup crash.
+        inputs = getattr(self, "inputs", None)
+        mode = getattr(self, "mode", "?")
+        count = len(inputs) if inputs is not None else 0
+        return f"{self.label} ({count} inputs, '{mode}')"
 
 
 class MQTTInput(Input):
@@ -629,6 +641,25 @@ class MQTTInput(Input):
         )
 
     def _load_state(self):
+        """Restore this input's last reading from the state file.
+
+        Nothing in here may raise: this runs during construction, so a state
+        file that is stale, hand-edited, or written by a different version would
+        otherwise stop the service from starting at all -- which is a far worse
+        outcome than starting with no remembered reading.
+        """
+        try:
+            self._load_state_inner()
+        except Exception as e:
+            self.service.log.exception(
+                f"Input '{self.label}' | Ignoring unusable stored state ({e!r})"
+            )
+            self.last_raw_value = None
+            self.last_eval_value = None
+            self.last_update = None
+            self.state = InputState.UNKNOWN
+
+    def _load_state_inner(self):
         assert self.service.state
         stored_state = self.service.state.get_path(
             "mqtt_input", self.mqtt, self.condition, "last_state", default=None
@@ -636,17 +667,10 @@ class MQTTInput(Input):
         if stored_state is None:
             return
 
-        try:
-            self.last_raw_value = stored_state["last_raw_value"]
-            self.last_eval_value = stored_state["last_eval_value"]
-            self.last_update = stored_state["last_update"]
-            self.state = InputState(stored_state["state"])
-        except (KeyError, TypeError, ValueError) as e:
-            self.service.log.error(
-                f"Group {self.group}, input {self} | Ignoring unusable stored "
-                f"state ({e!r})"
-            )
-            return
+        self.last_raw_value = stored_state["last_raw_value"]
+        self.last_eval_value = stored_state["last_eval_value"]
+        self.last_update = stored_state["last_update"]
+        self.state = InputState(stored_state["state"])
 
         # Restoring the state avoids reporting every change-only sensor as
         # offline after a restart -- but it must not launder stale data into
@@ -657,20 +681,26 @@ class MQTTInput(Input):
         if self.silence_timeout is None:
             return
 
-        if self.last_update is None:
+        if not isinstance(self.last_update, datetime):
+            if self.last_update is not None:
+                self.service.log.error(
+                    f"Input '{self.label}' | Stored last_update is "
+                    f"{self.last_update!r}, not a timestamp; treating as offline"
+                )
+            self.last_update = None
             self.state = InputState.OFFLINE
             return
 
         age = datetime.now() - self.last_update
         if age >= self.silence_timeout:
             self.service.log.warning(
-                f"Group {self.group}, input {self} | Stored reading is "
+                f"Input '{self.label}' | Stored reading is "
                 f"{format_timespan(age)} old (silence timeout "
                 f"{format_timespan(self.silence_timeout)}); treating as offline"
             )
             self.state = InputState.OFFLINE
         elif self.silence_timeout_check_loop is not None:
-            remaining = self.silence_timeout - age
+            remaining = max(self.silence_timeout - age, timedelta(seconds=1))
             self.silence_timeout_check_loop.interval = remaining
             self.silence_timeout_check_loop.start(delayed=True)
             self.silence_timeout_check_loop.interval = self.silence_timeout
@@ -1131,6 +1161,21 @@ class AlarmGroup:
             return
 
         if state == AlarmState.OFF:
+            # The alarm was legitimately off at shutdown. If an input is
+            # nevertheless reading active, deliberately do not re-trigger --
+            # that is what "reset while the door stayed open" looks like, and
+            # firing at boot would be a false alarm. But say so, because
+            # otherwise the group looks armed while one of its inputs is already
+            # active and cannot rise again.
+            active = [
+                str(i) for i in self.inputs if i.is_live() and i.get_last_value()
+            ]
+            if active and self.enabled:
+                self.service.warning(
+                    f"{self} | Armed after restart while these inputs already read "
+                    f"active: {', '.join(active)}. They will not trigger until they "
+                    f"clear and become active again."
+                )
             return
 
         self.service.warning(
