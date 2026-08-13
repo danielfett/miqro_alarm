@@ -981,14 +981,61 @@ class AlarmGroup:
             display_name=f"active inputs",
         )
 
-    def get_active_inputs_string(self):
-        return ", ".join(
-            [
-                str(i)
-                for i in self.inputs
-                if i.get_state() == InputState.ONLINE and i.get_last_value()
-            ]
+        ha_offline_inputs_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/offline_inputs_text",
+            name=f"{self.name} offline inputs",
+            display_name=f"offline inputs",
         )
+
+        ha_active_inhibitors_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/active_inhibitors_text",
+            name=f"{self.name} active inhibitors",
+            display_name=f"active inhibitors",
+        )
+
+        ha_offline_inhibitors_sensor = miqro.ha_sensors.Sensor(
+            device=self.ha_device,
+            state_topic_postfix=f"{self.name}/offline_inhibitors_text",
+            name=f"{self.name} offline inhibitors",
+            display_name=f"offline inhibitors",
+        )
+
+    @staticmethod
+    def _active_string(elements):
+        """The elements that are verifiably reading 'triggered' right now.
+
+        Only live elements are listed: the value of an offline input says
+        nothing about the world, it is just the last thing that was heard.
+        """
+        return ", ".join(str(i) for i in elements if i.is_live() and i.get_last_value())
+
+    @staticmethod
+    def _offline_string(elements):
+        """The elements whose value cannot currently be trusted, with the reason.
+
+        Everything that is not ONLINE is listed -- offline, never seen, and
+        unparseable all mean the same thing operationally: this sensor is not
+        protecting anything right now.
+        """
+        return ", ".join(
+            f"{i} ({i.get_state().name.lower().replace('_', ' ')})"
+            for i in elements
+            if not i.is_live()
+        )
+
+    def get_active_inputs_string(self):
+        return self._active_string(self.inputs)
+
+    def get_offline_inputs_string(self):
+        return self._offline_string(self.inputs)
+
+    def get_active_inhibitors_string(self):
+        return self._active_string(self.inhibitors)
+
+    def get_offline_inhibitors_string(self):
+        return self._offline_string(self.inhibitors)
 
     def any_inhibitor_active(self):
         """Whether an inhibitor is currently, verifiably suppressing this group.
@@ -1254,6 +1301,9 @@ class AlarmGroup:
             "liveness": {},
             "label": self.label,
             "active_inputs_text": self.get_active_inputs_string() or "none",
+            "offline_inputs_text": self.get_offline_inputs_string() or "none",
+            "active_inhibitors_text": self.get_active_inhibitors_string() or "none",
+            "offline_inhibitors_text": self.get_offline_inhibitors_string() or "none",
         }
 
         for category, elements in [

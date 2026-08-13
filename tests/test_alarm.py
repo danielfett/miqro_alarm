@@ -755,3 +755,45 @@ def test_debounce(service):
         },
         1.9,
     )
+
+
+def test_active_and_offline_lists(service):
+    group = service.groups[0]
+
+    # Nothing has reported yet, so no input or inhibitor can be trusted.
+    state = group.get_state()
+    assert state["active_inputs_text"] == "none"
+    assert (
+        state["offline_inputs_text"]
+        == "Input 1 (unknown), Input 2 (unknown), Shared input (unknown)"
+    )
+    assert state["active_inhibitors_text"] == "none"
+    assert state["offline_inhibitors_text"] == "Inhibitor 1 (unknown)"
+
+    send(service, "group1/input1", "1")
+    send(service, "group1/input2", "0")
+    send(service, "shared/input0", "0")
+    send(service, "group1/inhibitor1", "1")
+
+    state = group.get_state()
+    assert state["active_inputs_text"] == "Input 1"
+    assert state["offline_inputs_text"] == "none"
+    assert state["active_inhibitors_text"] == "Inhibitor 1"
+    assert state["offline_inhibitors_text"] == "none"
+
+    expect_next(
+        service,
+        {
+            "service/alarm/g1/active_inputs_text": "m == 'Input 1'",
+            "service/alarm/g1/offline_inputs_text": "m == 'none'",
+            "service/alarm/g1/active_inhibitors_text": "m == 'Inhibitor 1'",
+            "service/alarm/g1/offline_inhibitors_text": "m == 'none'",
+        },
+    )
+
+    # Input 2 has a one second silence timeout: once that expires its reading
+    # is no longer evidence of anything, and it moves to the offline list.
+    run(service, 1.5)
+    state = group.get_state()
+    assert state["offline_inputs_text"] == "Input 2 (offline)"
+    assert state["active_inputs_text"] == "Input 1"

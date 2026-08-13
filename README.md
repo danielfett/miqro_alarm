@@ -164,6 +164,12 @@ content: >-
 
 ```
 
+The same card works for the other three lists by replacing the entity pattern
+with `sensor.*_offline_inputs`, `sensor.*_active_inhibitors`, or
+`sensor.*_offline_inhibitors`. The offline lists are the ones worth putting on a
+dashboard permanently: an input that is offline is not watching anything, and an
+inhibitor that is offline is being ignored (see below).
+
 ### MQTT Topics
 
 #### :outbox_tray: Published Topics 
@@ -183,6 +189,14 @@ content: >-
  * `service/alarm/GROUP1/live` — `1` when all liveness checks for this group are OK and all inputs and inhibitors are live
 
  * `service/alarm/g1/display_state` — a unified view on the state of this alarm group: `disabled`, `inhibited`, `enabled`, `prealarm`, `alarm` — recommended for use in user interfaces
+
+ * `service/alarm/GROUP1/active_inputs_text` — comma-separated list of the inputs that are currently online *and* triggered, or `none`
+
+ * `service/alarm/GROUP1/offline_inputs_text` — comma-separated list of the inputs that are not online, each with its state in parentheses (e.g. `front door (offline)`), or `none`
+
+ * `service/alarm/GROUP1/active_inhibitors_text` — same as `active_inputs_text`, but for the inhibitors of this group
+
+ * `service/alarm/GROUP1/offline_inhibitors_text` — same as `offline_inputs_text`, but for the inhibitors of this group. An inhibitor listed here is *not* suppressing the alarm, even if its last known value was "active"
 
 **For each input of the group:**
 

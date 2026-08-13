@@ -315,6 +315,12 @@ def test_stale_inhibitor_does_not_suppress_the_alarm(tmp_path):
     assert group.inhibitors[0].get_state() == InputState.OFFLINE
     assert not group.any_inhibitor_active(), "a dead inhibitor still suppresses alarms"
 
+    # An inhibitor that is being ignored has to be visible, otherwise the group
+    # silently stops behaving the way its configuration says it does.
+    state = group.get_state()
+    assert state["active_inhibitors_text"] == "none"
+    assert state["offline_inhibitors_text"] == "At home (offline)"
+
     send(service, "in/door", "1")
     expect_next(service, {"out/siren": "m == 'alarm-intrusion'"})
 
