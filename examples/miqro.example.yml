@@ -58,7 +58,8 @@ services:
     text_outputs:
       sms_owner:
         mqtt: service/uplink/sms/send/555111666
-        info: True # Whether or not to send less-important 'info' messages to this output
+        info: True # Whether to send notifications about problems (🔴/🟡/🟢) to this
+                   # output, in addition to the alarm messages themselves
       pushover_alarm:
         mqtt: service/pushover/send/alarm
       pushover_info:

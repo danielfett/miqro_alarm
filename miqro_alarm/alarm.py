@@ -1,6 +1,7 @@
 import miqro
 import requests
-from typing import Optional, Dict, List, Tuple, Union
+from itertools import count
+from typing import Callable, Optional, Dict, List, Tuple, Union
 from datetime import timedelta, datetime
 from enum import Enum
 from dataclasses import dataclass, field
@@ -11,6 +12,29 @@ from json import loads
 # Distinguishes "the configuration did not mention this" from an explicit null,
 # which for a timeout means "disable it".
 _UNSET = object()
+
+
+class Severity(Enum):
+    """How bad an active condition is."""
+
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass
+class Condition:
+    """A problem that is currently true, and was announced when it became true.
+
+    Conditions are what the service tells its users about.  They are announced
+    exactly twice -- once when they start and once when they end -- rather than
+    every time the code that detects them happens to run, because a channel that
+    repeats the same complaint every few seconds is a channel nobody reads.
+    """
+
+    severity: Severity
+    message: str
+    resolved_message: str
+    since: datetime
 
 
 class SwitchOutput:
@@ -83,6 +107,14 @@ class AlarmState(Enum):
     PREALARM = 1
     ALARM = 2
 
+    def headline(self):
+        """How an alarm message announces this state."""
+        return {
+            AlarmState.OFF: "⎚ Cleared",
+            AlarmState.PREALARM: "⚠️ Prealarm",
+            AlarmState.ALARM: "🚨 ALARM",
+        }[self]
+
 
 # Sortable alarm requests
 @dataclass(order=True)
@@ -101,6 +133,9 @@ class SwitchOutputGroup:
     requests: List[AlarmRequest]
     state: AlarmState = AlarmState.OFF
     current_schedule: Optional[str] = None
+    # Assigned by create_outputs once the configured name is known; messages
+    # about this output are read by humans, and an object repr is not a name.
+    name: str = "unnamed"
 
     def __init__(self, service, **schedules: Dict[str, Dict]):
         self.service = service
@@ -118,6 +153,9 @@ class SwitchOutputGroup:
                 self.resets[name] = SwitchOutput(service, **s["reset"])
             self.schedules[name] = schedule
 
+    def __str__(self):
+        return self.name
+
     def has_output_for(self, schedule: Optional[str], state: AlarmState) -> bool:
         return schedule in self.schedules and state in self.schedules[schedule]
 
@@ -125,22 +163,34 @@ class SwitchOutputGroup:
         if self.state == AlarmState.OFF:
             return
 
+        # One condition per output for "could not be switched off cleanly": it
+        # means a siren may still be running, and it resolves the next time this
+        # output switches off the way it is supposed to.
+        key = f"output-off:{id(self)}"
+
         if self.current_schedule is None:
-            self.service.log.error(
-                f"Output {self} | In state {self.state} with no current schedule; "
-                f"forcing to OFF"
+            self.service.raise_condition(
+                key,
+                f"Output '{self}' | In state {self.state.name.lower()} with no current "
+                f"schedule; forcing it to OFF",
+                resolved=f"Output '{self}' | Switched off cleanly again",
             )
             self.state = AlarmState.OFF
             return
 
         output = self.schedules.get(self.current_schedule, {}).get(self.state)
         if output is None:
-            self.service.log.error(
-                f"Output {self} | No '{self.state.name.lower()}' output defined for "
-                f"schedule '{self.current_schedule}'; cannot switch it off"
+            self.service.raise_condition(
+                key,
+                f"Output '{self}' | No '{self.state.name.lower()}' output defined for "
+                f"schedule '{self.current_schedule}'; CANNOT SWITCH IT OFF",
+                resolved=f"Output '{self}' | Switched off cleanly again",
             )
         else:
             output.off()
+            self.service.clear_condition(
+                key, f"Output '{self}' | Switched off cleanly again"
+            )
 
         if self.current_schedule in self.resets:
             self.resets[self.current_schedule].on()
@@ -148,18 +198,30 @@ class SwitchOutputGroup:
 
     def _switch_on(self, target: AlarmRequest):
         if target.schedule is None:
-            self.service.log.error(f"Output {self} | Request without a schedule ignored")
+            self.service.log.error(f"Output '{self}' | Request without a schedule ignored")
             return
 
+        # Keyed by what is missing, so that fixing one schedule resolves its own
+        # condition rather than the next alarm's.
+        key = f"output-on:{id(self)}:{target.schedule}:{target.state.name}"
         output = self.schedules.get(target.schedule, {}).get(target.state)
         if output is None:
             # Should have been caught by validation at startup; refuse loudly
             # rather than raising out of the middle of the alarm path.
-            self.service.warning(
-                f"Output {self} | No '{target.state.name.lower()}' output defined for "
-                f"schedule '{target.schedule}' -- THIS ALARM PRODUCES NO OUTPUT"
+            self.service.raise_condition(
+                key,
+                f"Output '{self}' | No '{target.state.name.lower()}' output defined for "
+                f"schedule '{target.schedule}' -- THIS ALARM PRODUCES NO OUTPUT",
+                resolved=f"Output '{self}' | The '{target.state.name.lower()}' output "
+                f"for schedule '{target.schedule}' works again",
             )
             return
+
+        self.service.clear_condition(
+            key,
+            f"Output '{self}' | The '{target.state.name.lower()}' output for schedule "
+            f"'{target.schedule}' works again",
+        )
 
         if self.current_schedule and self.current_schedule in self.resets:
             self.resets[self.current_schedule].off()
@@ -236,11 +298,21 @@ class TextOutput:
         if alarm_information == self.published_alarm_information:
             return
 
-        message = self._format_msg(alarm_information, update_reason)
+        # Groups that were in the last message and are not in this one have
+        # ended.  Whoever was told an alarm started is owed the other half of
+        # the story, so they are named rather than silently dropped.
+        cleared = [
+            label
+            for label in (self.published_alarm_information or {})
+            if label not in alarm_information
+        ]
+
+        message = self._format_msg(alarm_information, update_reason, cleared)
 
         if not message:
-            # Nothing is active any more.  Publishing the empty string would
-            # send an empty SMS through a text gateway.
+            # Nothing to say: no group is active and none just ended.  Note that
+            # publishing the empty string would send an empty SMS through a text
+            # gateway.
             self.published_alarm_information = alarm_information
             return
 
@@ -257,7 +329,9 @@ class TextOutput:
             )
 
     def send_info(self, message):
-        self.service.publish(self.mqtt, message, global_=True)
+        # Each notification is sent exactly once, so a redelivery attempt is the
+        # difference between the user hearing about a dead sensor and not.
+        self.service.publish(self.mqtt, message, qos=1, global_=True)
 
     def _get_group_information(self, group: "AlarmGroup"):
         return {
@@ -271,10 +345,21 @@ class TextOutput:
             ],
         }
 
-    def _format_msg(self, alarm_information, update_reason):
-        output_strings = []
+    def _format_msg(self, alarm_information, update_reason, cleared=()):
+        output_strings = [
+            f"{AlarmState.OFF.headline()}, {label}" for label in cleared
+        ]
+
         for label, g in alarm_information.items():
-            group_info = f"{str(update_reason)}, {label}: "
+            # Each line announces its own group's state rather than the event
+            # that caused the message.  A message is triggered by one group but
+            # restates all of them, so taking the wording from the event marked
+            # a group that is merely in prealarm as an ALARM -- and would now
+            # put a 🚨 on it.
+            headline = AlarmState[g["state"]].headline()
+            if update_reason is UpdateReason.UPDATE_ALARM:
+                headline += " (update)"
+            group_info = f"{headline}, {label}: "
             group_info += ", ".join(input["name"] for input in g["inputs"])
             output_strings.append(group_info)
         return "\n".join(output_strings)
@@ -301,26 +386,17 @@ class InputState(Enum):
 
 
 class UpdateReason(Enum):
+    """Why outputs are being updated.
+
+    Only UPDATE_ALARM changes how a message reads -- the others say which event
+    triggered it, which the message no longer takes its wording from, since it
+    restates every active group rather than only the one that changed.
+    """
+
     SWITCH_TO_OFF = 0
     SWITCH_TO_PREALARM = 1
     SWITCH_TO_ALARM = 2
     UPDATE_ALARM = 3
-
-    def yaml_identifier(self):
-        return {
-            UpdateReason.SWITCH_TO_OFF: "off",
-            UpdateReason.SWITCH_TO_PREALARM: "prealarm",
-            UpdateReason.SWITCH_TO_ALARM: "alarm",
-            UpdateReason.UPDATE_ALARM: "update",
-        }[self]
-
-    def __str__(self):
-        return {
-            UpdateReason.SWITCH_TO_OFF: "Off",
-            UpdateReason.SWITCH_TO_PREALARM: "Prealarm",
-            UpdateReason.SWITCH_TO_ALARM: "ALARM",
-            UpdateReason.UPDATE_ALARM: "Update",
-        }[self]
 
 
 class Input:
@@ -335,10 +411,15 @@ class Input:
     debounce_timeout_check_loop: Optional[miqro.Loop] = None
     debounce_observed_value = None
 
+    # Condition keys have to identify one input object, and labels are only
+    # unique within a group -- the same sensor may well appear in two groups.
+    _ids = count()
+
     def __init__(self, service, group, label, debounce=None):
         self.service = service
         self.group = group
         self.label = label
+        self._uid = next(Input._ids)
 
         if debounce:
             # create debounce loop
@@ -356,6 +437,9 @@ class Input:
     def is_live(self):
         """Whether this input's value can currently be trusted."""
         return self.get_state() == InputState.ONLINE
+
+    def condition_key(self, kind: str) -> str:
+        return f"{kind}:{self._uid}:{self.label}"
 
     def __str__(self):
         return self.label
@@ -503,6 +587,7 @@ class MQTTInput(Input):
     silence_timeout_check_loop: Optional[miqro.Loop] = None
 
     last_raw_value: Optional[str] = None
+    last_eval_error: Optional[str] = None
 
     def __init__(
         self,
@@ -553,7 +638,7 @@ class MQTTInput(Input):
         service that is watching it.
         """
         try:
-            return True, eval(
+            value = eval(
                 self.condition,
                 {
                     "value": raw_value,
@@ -564,12 +649,15 @@ class MQTTInput(Input):
                 },
             )
         except Exception as e:
-            self.service.warning_throttled(
-                f"{self.mqtt}:eval",
+            self.last_eval_error = f"{e}"
+            self.service.log.warning(
                 f"Group {self.group}, input {self} | Evaluation of input "
-                f"'{raw_value}' failed: {e}",
+                f"'{raw_value}' failed: {e}"
             )
             return False, self.last_eval_value
+
+        self.last_eval_error = None
+        return True, value
 
     def handle(self, _, raw_value):
         self.last_update = datetime.now()
@@ -584,8 +672,42 @@ class MQTTInput(Input):
         # cannot handle still reported healthy while being functionally dead.
         self.state = InputState.ONLINE if ok else InputState.INVALID_RESPONSE
 
+        self._report_reception(ok, raw_value)
+
         self._handle_change(new_eval_value)
         self._store_state()
+
+    def _report_reception(self, ok: bool, raw_value: str):
+        """Update the conditions that a received message settles.
+
+        Both are resolved by this message: the input is demonstrably not silent,
+        and whether its payload can be understood is known right now.
+        """
+        self.service.clear_condition(
+            self.condition_key("input-silent"),
+            f"{self._describe()}: Reporting again",
+        )
+        self.service.set_condition(
+            self.condition_key("input-invalid"),
+            not ok,
+            message=(
+                f"{self._describe()}: Payload '{raw_value}' cannot be evaluated "
+                f"({self.last_eval_error}); this input is not protecting anything"
+            ),
+            resolved=f"{self._describe()}: Payload can be evaluated again",
+        )
+
+    def _describe(self) -> str:
+        return f"Group {self.group}, input {self}"
+
+    def _go_offline(self, detail: str):
+        """Mark the input untrustworthy and say so, once."""
+        self.state = InputState.OFFLINE
+        self.service.raise_condition(
+            self.condition_key("input-silent"),
+            f"{self._describe()}: {detail}",
+            resolved=f"{self._describe()}: Reporting again",
+        )
 
     @staticmethod
     def try_float(inval):
@@ -611,18 +733,16 @@ class MQTTInput(Input):
             )
 
     def _check_silence_timeout(self, _):
-        self.state = InputState.OFFLINE
         if self.last_update is None:
-            assert self.silence_timeout_check_loop is not None
             span = datetime.now() - self.service.started
-            self.service.warning(
-                f"Group {self.group}, input {self}: Silent since launch ({format_timespan(span)} ago)"
-            )
+            detail = f"Silent since launch ({format_timespan(span)} ago)"
         else:
             span = datetime.now() - self.last_update
-            self.service.warning(
-                f"Group {self.group}, input {self}: Silent for {format_timespan(span)}"
-            )
+            detail = f"Silent for {format_timespan(span)}"
+
+        # This loop keeps running, so the wording stays current for as long as
+        # the input is silent -- but only the first pass is announced.
+        self._go_offline(detail)
 
     def _store_state(self, _=None):
         # service saves periodically
@@ -688,17 +808,15 @@ class MQTTInput(Input):
                     f"{self.last_update!r}, not a timestamp; treating as offline"
                 )
             self.last_update = None
-            self.state = InputState.OFFLINE
+            self._go_offline("Has not reported since the service was restarted")
             return
 
         age = datetime.now() - self.last_update
         if age >= self.silence_timeout:
-            self.service.log.warning(
-                f"Input '{self.label}' | Stored reading is "
-                f"{format_timespan(age)} old (silence timeout "
-                f"{format_timespan(self.silence_timeout)}); treating as offline"
+            self._go_offline(
+                f"Silent for {format_timespan(age)}, since before the restart "
+                f"(silence timeout {format_timespan(self.silence_timeout)})"
             )
-            self.state = InputState.OFFLINE
         elif self.silence_timeout_check_loop is not None:
             remaining = max(self.silence_timeout - age, timedelta(seconds=1))
             self.silence_timeout_check_loop.interval = remaining
@@ -743,20 +861,32 @@ class LivenessInput(MQTTInput):
 
         # A liveness check watches something that may itself be malfunctioning,
         # so an unparseable payload is an expected input here, not a bug.  It
-        # counts as an invalid response rather than propagating.
+        # counts as an invalid response rather than propagating -- which the
+        # grace period below reports, so no 'invalid payload' condition is
+        # raised for a liveness input.
         ok, new_eval_value = self._evaluate(raw_value)
         if not ok:
             new_eval_value = False
 
+        self.service.clear_condition(
+            self.condition_key("input-silent"),
+            f"{self._describe()}: Reporting again",
+        )
+
         self._handle_change(new_eval_value)
         self._store_state()
 
+    def _describe(self) -> str:
+        return f"Group {self.group}, liveness input {self}"
+
     def check_invalid_response_timeout(self, _):
-        self.service.warning(
-            f"Group {self.group}, liveness input {self}: Invalid response "
-            f"({self.last_raw_value}) since {self.last_update}!"
+        self.service.raise_condition(
+            self.condition_key("liveness-invalid"),
+            f"{self._describe()}: Invalid response ({self.last_raw_value}) "
+            f"since {self.last_update}",
+            resolved=f"{self._describe()}: Responding correctly again",
         )
-        return False  # one warning per episode
+        return False  # the condition itself keeps this from repeating
 
     def _handle_change(self, new_eval_value):
         if new_eval_value == self.last_eval_value:
@@ -770,6 +900,10 @@ class LivenessInput(MQTTInput):
         if new_eval_value:
             self.state = InputState.ONLINE
             self.invalid_response_timeout_check_loop.stop()
+            self.service.clear_condition(
+                self.condition_key("liveness-invalid"),
+                f"{self._describe()}: Responding correctly again",
+            )
         else:
             self.state = InputState.INVALID_RESPONSE
             # Warn only once the response has been invalid for the configured
@@ -1045,19 +1179,60 @@ class AlarmGroup:
         a presence sensor that lost power, or a value restored from the state
         file after a restart -- suppresses the alarm indefinitely, silently.
         Inhibition fails open.
+
+        Deliberately silent: the fact that an inhibitor is being ignored is
+        reported by :meth:`refresh_conditions`, which sees all of them and also
+        notices when one becomes trustworthy again.
+        """
+        return any(
+            inhibitor.get_last_value() and inhibitor.is_live()
+            for inhibitor in self.inhibitors
+        )
+
+    @staticmethod
+    def _is_stale(element) -> bool:
+        """Reads 'triggered', but that reading can no longer be trusted."""
+        return bool(element.get_last_value()) and not element.is_live()
+
+    def refresh_conditions(self):
+        """Re-derive the conditions that end without passing through this code.
+
+        An inhibitor that starts reporting again, or an alarm that is reset,
+        ends one of these silently, so both directions are decided from the
+        current state rather than from the event that caused it.
         """
         for inhibitor in self.inhibitors:
-            if not inhibitor.get_last_value():
-                continue
-            if inhibitor.is_live():
-                return True
-            self.service.warning_throttled(
-                f"{self.name}:stale-inhibitor:{inhibitor.label}",
-                f"{self} | Inhibitor '{inhibitor}' reads active but is "
-                f"{inhibitor.get_state().name.lower()}; ignoring it so the alarm "
-                f"stays armed",
+            state = inhibitor.get_state().name.lower().replace("_", " ")
+            self.service.set_condition(
+                inhibitor.condition_key("stale-inhibitor"),
+                self._is_stale(inhibitor),
+                severity=Severity.WARNING,
+                message=(
+                    f"{self} | Inhibitor '{inhibitor}' reads active but is {state}; "
+                    f"ignoring it so the alarm stays armed"
+                ),
+                resolved=f"{self} | Inhibitor '{inhibitor}' counts again ({state})",
             )
-        return False
+
+        # Only meaningful where an alarm would otherwise reset itself: elsewhere
+        # nothing is being held, and the input's own offline condition says all
+        # there is to say.
+        holds_alarm = self.reset_delay is not None and self.state in (
+            AlarmState.ALARM,
+            AlarmState.PREALARM,
+        )
+        for input in self.inputs:
+            state = input.get_state().name.lower().replace("_", " ")
+            self.service.set_condition(
+                input.condition_key("stale-input"),
+                holds_alarm and self._is_stale(input),
+                severity=Severity.WARNING,
+                message=(
+                    f"{self} | Input '{input}' went {state} while reading active; "
+                    f"holding the alarm rather than resetting it"
+                ),
+                resolved=f"{self} | Input '{input}' no longer holds the alarm",
+            )
 
     def on(self, input):
         self.update_sensor_stream(input)
@@ -1106,19 +1281,9 @@ class AlarmGroup:
         # counted as clear, so an input dying mid-alarm released the alarm --
         # which is exactly what cutting power to a sensor looks like.  An input
         # that has never reported at all still counts as clear, since it is not
-        # holding anything.
-        def is_clear(i):
-            if not i.get_last_value():
-                return True
-            if not i.is_live():
-                self.service.warning_throttled(
-                    f"{self.name}:stale-input:{i.label}",
-                    f"{self} | Input '{i}' went {i.get_state().name.lower()} while "
-                    f"reading active; holding the alarm rather than resetting it",
-                )
-            return False
-
-        if all(is_clear(i) for i in self.inputs):
+        # holding anything.  A triggered-but-dead input holding the alarm is
+        # reported by refresh_conditions rather than from here.
+        if all(not i.get_last_value() for i in self.inputs):
             self.service.log.info(f"Starting timeout for alarm reset")
             self.alarm_to_reset_loop.start(delayed=True)
 
@@ -1218,14 +1383,14 @@ class AlarmGroup:
                 str(i) for i in self.inputs if i.is_live() and i.get_last_value()
             ]
             if active and self.enabled:
-                self.service.warning(
+                self.service.notify(
                     f"{self} | Armed after restart while these inputs already read "
                     f"active: {', '.join(active)}. They will not trigger until they "
                     f"clear and become active again."
                 )
             return
 
-        self.service.warning(
+        self.service.notify(
             f"{self} | Restoring {state.name} state that was active before the "
             f"restart; re-asserting outputs"
         )
@@ -1423,9 +1588,14 @@ class AlarmService(miqro.Service):
     # ask the broker to hold messages for us while we are away.
     CLEAN_SESSION = False
 
-    # Repeated warnings about the same thing are suppressed for this long, so
-    # that a sensor emitting garbage at 10 Hz cannot bury everything else.
-    WARNING_THROTTLE = timedelta(minutes=15)
+    # Every user-facing message starts with one of these, so that the state of
+    # the system is readable from the notification itself.
+    ICONS = {Severity.ERROR: "🔴", Severity.WARNING: "🟡"}
+    ICON_RESOLVED = "🟢"
+
+    # Notifications raised while disconnected wait for the connection; this is
+    # how many of them are kept.
+    MAX_PENDING_NOTIFICATIONS = 50
 
     probe_output: Optional[SwitchOutput] = None
     text_outputs: Dict[str, TextOutput]
@@ -1440,11 +1610,13 @@ class AlarmService(miqro.Service):
         super().__init__(*args, **kwargs)
 
         self.started = datetime.now()
-        self._warning_sent_at: Dict[str, datetime] = {}
+        self._conditions: Dict[str, Condition] = {}
+        self._pending_notifications: List[str] = []
 
         self.create_outputs()
         self.create_alarm_groups()
         self.validate_configuration()
+        self.check_input_consistency()
 
         # Restore alarms that were active before the restart only once
         # everything they drive exists.
@@ -1469,7 +1641,11 @@ class AlarmService(miqro.Service):
         self.switch_outputs = {}
         for name, config in self.service_config.get("switch_outputs", {}).items():
             self.log.debug(f"Creating switch output: {name}")
-            self.switch_outputs[name] = SwitchOutputGroup(self, **config)
+            # Set after construction rather than as a keyword argument, which
+            # would collide with a schedule that happens to be called 'name'.
+            output = SwitchOutputGroup(self, **config)
+            output.name = name
+            self.switch_outputs[name] = output
 
     def validate_configuration(self):
         """Reject a configuration that cannot drive its outputs.
@@ -1530,6 +1706,59 @@ class AlarmService(miqro.Service):
 
         self.log.info(f"Configuration validated: {len(self.groups)} alarm group(s)")
 
+    def _configured_inputs(self):
+        """Every MQTT input in the configuration, with the group it serves.
+
+        MultiInput children subscribe to their own topics and run their own
+        silence detection, so they count here even though their group only ever
+        sees the parent.
+        """
+
+        def walk(group, inputs):
+            for input in inputs:
+                if isinstance(input, MultiInput):
+                    yield from walk(group, input.inputs)
+                else:
+                    yield group, input
+
+        for group in self.groups:
+            yield from walk(group, [*group.inputs, *group.inhibitors, *group.liveness])
+
+    @staticmethod
+    def _describe_timeout(timeout: Optional[timedelta]) -> str:
+        return format_timespan(timeout) if timeout else "no silence detection"
+
+    def check_input_consistency(self):
+        """Report inputs that watch the same topic but disagree about it.
+
+        Two inputs on one topic with different silence timeouts describe the
+        same sensor as online and offline at the same time, and they share a
+        single slot in the state file, so the one that writes last decides what
+        the other remembers after a restart.  That is almost always an
+        oversight -- but a working alarm built on it must not be refused a
+        start, so it is reported rather than rejected.
+        """
+        by_topic: Dict[str, List[Tuple[AlarmGroup, MQTTInput]]] = {}
+        for group, input in self._configured_inputs():
+            by_topic.setdefault(input.mqtt, []).append((group, input))
+
+        for topic, users in by_topic.items():
+            if len({input.silence_timeout for _, input in users}) < 2:
+                continue
+
+            detail = ", ".join(
+                f"'{input.label}' in group '{group.name}' "
+                f"({self._describe_timeout(input.silence_timeout)})"
+                for group, input in users
+            )
+            self.raise_condition(
+                f"topic-timeout-mismatch:{topic}",
+                f"Topic '{topic}' is watched by {len(users)} inputs that disagree "
+                f"about when it counts as silent: {detail}. The same sensor will be "
+                f"reported offline at different times; give them one silence_timeout.",
+                severity=Severity.WARNING,
+            )
+
     def probe_healthy(self) -> bool:
         """Whether it is honest to tell an external watchdog that we are fine.
 
@@ -1546,27 +1775,140 @@ class AlarmService(miqro.Service):
             return False
         return True
 
-    def warning(self, msg):
-        self.log.warning(msg)
+    # -- notifications --------------------------------------------------------
+
+    def condition_counts(self) -> Tuple[int, int]:
+        """(errors, warnings) that are active right now."""
+        errors = sum(
+            1 for c in self._conditions.values() if c.severity is Severity.ERROR
+        )
+        return errors, len(self._conditions) - errors
+
+    def condition_summary(self) -> str:
+        errors, warnings = self.condition_counts()
+        return (
+            f"{errors} error{'' if errors == 1 else 's'}, "
+            f"{warnings} warning{'' if warnings == 1 else 's'}"
+        )
+
+    def condition_text(self) -> str:
+        """Everything that is currently wrong, for the health topic."""
+        if not self._conditions:
+            return "none"
+        return "; ".join(
+            f"{self.ICONS[c.severity]} {c.message} (since {c.since:%Y-%m-%d %H:%M})"
+            for c in self._conditions.values()
+        )
+
+    def notify(self, message: str, severity: Severity = Severity.WARNING) -> None:
+        """Announce a one-off event that has no lasting condition to resolve."""
+        self._notify(
+            self.ICONS[severity],
+            message,
+            self.log.error if severity is Severity.ERROR else self.log.warning,
+        )
+
+    def set_condition(
+        self,
+        key: str,
+        active: bool,
+        *,
+        severity: Severity = Severity.ERROR,
+        message: str = "",
+        resolved: Optional[str] = None,
+    ) -> None:
+        """Record whether a condition holds, announcing only its transitions.
+
+        Callers may -- and the periodic refresh does -- call this every time they
+        re-evaluate the condition; only the first call that turns it on and the
+        first one that turns it off produce a message.  While a condition stays
+        active its text is kept up to date silently, so the health topic shows
+        the current wording (for example a growing "silent for ..." span).
+        """
+        current = self._conditions.get(key)
+
+        if active:
+            if current is not None:
+                if message:
+                    current.message = message
+                return
+            self._conditions[key] = Condition(
+                severity=severity,
+                message=message,
+                resolved_message=resolved or f"Resolved: {message}",
+                since=datetime.now(),
+            )
+            self._notify(
+                self.ICONS[severity],
+                message,
+                self.log.error if severity is Severity.ERROR else self.log.warning,
+            )
+            return
+
+        if current is None:
+            return
+        del self._conditions[key]
+        self._notify(
+            self.ICON_RESOLVED, resolved or current.resolved_message, self.log.info
+        )
+
+    def raise_condition(
+        self,
+        key: str,
+        message: str,
+        severity: Severity = Severity.ERROR,
+        resolved: Optional[str] = None,
+    ) -> None:
+        self.set_condition(
+            key, True, severity=severity, message=message, resolved=resolved
+        )
+
+    def clear_condition(self, key: str, resolved: Optional[str] = None) -> None:
+        self.set_condition(key, False, resolved=resolved)
+
+    def _notify(self, icon: str, message: str, log: Callable[[str], None]) -> None:
+        # The counts are baked in here rather than when the message is sent, so
+        # that a notification always describes the moment it belongs to.
+        text = f"{icon} {message} [{self.condition_summary()}]"
+        log(text)
+
+        if not self.is_connected:
+            # A publish before the broker connection exists is discarded, and
+            # every notification is sent exactly once -- so hold it until there
+            # is somewhere for it to go.  This matters at startup, where stored
+            # readings are checked for staleness before the first CONNACK.
+            # Bounded: an outage lasting days must not grow the process, and the
+            # newest messages are the ones worth keeping.
+            self._pending_notifications.append(text)
+            del self._pending_notifications[: -self.MAX_PENDING_NOTIFICATIONS]
+            return
+
+        self._send_notification(text)
+
+    def _send_notification(self, text: str) -> None:
         for output in self.text_outputs.values():
             if output.info:
-                output.send_info(msg)
+                output.send_info(text)
 
-    def warning_throttled(self, key: str, msg: str):
-        """Send a warning at most once per :attr:`WARNING_THROTTLE` per key.
-
-        Used for conditions that repeat per message -- a sensor whose payload
-        the condition cannot evaluate, a stale inhibitor -- where warning every
-        time turns the notification channel into noise and hides everything
-        else.
-        """
-        now = datetime.now()
-        last = self._warning_sent_at.get(key)
-        if last is not None and now - last < self.WARNING_THROTTLE:
-            self.log.debug(f"(throttled) {msg}")
+    @miqro.loop(seconds=1)
+    def _flush_notifications(self):
+        if not self._pending_notifications or not self.is_connected:
             return
-        self._warning_sent_at[key] = now
-        self.warning(msg)
+        pending = self._pending_notifications
+        self._pending_notifications = []
+        for text in pending:
+            self._send_notification(text)
+
+    @miqro.loop(seconds=1)
+    def refresh_conditions(self):
+        """Re-check the conditions that have no single place where they end.
+
+        An input coming back, an inhibitor becoming trustworthy again or an
+        alarm being reset all end one of these without passing through the code
+        that noticed them, so they are derived from the current state instead.
+        """
+        for group in self.groups:
+            group.refresh_conditions()
 
     def create_alarm_groups(self):
         self.groups = []
@@ -1653,11 +1995,17 @@ class AlarmService(miqro.Service):
     @miqro.loop(minutes=5)
     def report_health(self):
         """Publish whether the service is working, not merely running."""
+        errors, warnings = self.condition_counts()
         self.publish("health/ok", self.healthy(), only_if_changed=True)
         self.publish("health/failures", self.failure_count, only_if_changed=True)
         self.publish(
             "health/last_failure", self.last_failure or "none", only_if_changed=True
         )
+        # The notifications are one-shot; these say what is wrong *now*, for
+        # anything that missed the message or started up afterwards.
+        self.publish("health/errors", errors, only_if_changed=True)
+        self.publish("health/warnings", warnings, only_if_changed=True)
+        self.publish("health/conditions", self.condition_text(), only_if_changed=True)
 
 
 def run():

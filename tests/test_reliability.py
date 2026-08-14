@@ -280,6 +280,301 @@ def test_probe_is_suppressed_when_the_service_cannot_work(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Alarm messages: severity is readable at a glance
+# --------------------------------------------------------------------------
+
+
+def test_a_prealarm_and_an_alarm_are_marked_differently(tmp_path):
+    def with_prealarm(alarm):
+        group = alarm["groups"][0]
+        group["prealarm"] = {"seconds": 60}
+        group["outputs"] = {"prealarm": ["sms"], "alarm": [{"siren": "intrusion"}, "sms"]}
+
+    service = make_service(tmp_path, with_prealarm)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "m == '⚠️ Prealarm, Group A: Door'"})
+
+    service.groups[0].do_alarm("test")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
+
+
+def test_a_group_in_prealarm_is_not_marked_as_an_alarm(tmp_path):
+    """One group escalating must not put a 🚨 on a group that is only in prealarm.
+
+    A message is triggered by one group but restates all of them, so taking the
+    wording from the triggering event mislabels every other group.
+    """
+
+    def two_groups(alarm):
+        alarm["groups"][0]["prealarm"] = {"seconds": 60}
+        alarm["groups"][0]["outputs"] = {
+            "prealarm": ["sms"],
+            "alarm": [{"siren": "intrusion"}, "sms"],
+        }
+        alarm["groups"].append(
+            {
+                "name": "gb",
+                "label": "Group B",
+                "default_enabled": True,
+                "inputs": [
+                    {"mqtt": "in/window", "when": "is_on(value)", "label": "Window"}
+                ],
+                "outputs": {"alarm": [{"siren": "intrusion"}, "sms"]},
+            }
+        )
+
+    service = make_service(tmp_path, two_groups)
+
+    send(service, "in/door", "1")  # Group A: prealarm
+    expect_next(service, {"out/sms": "m.startswith('⚠️')"})
+
+    send(service, "in/window", "1")  # Group B: straight to alarm
+    seen = expect_next(service, {"out/sms": "'Group B' in m"})
+
+    message = texts_on(seen)[-1]
+    assert message == "⚠️ Prealarm, Group A: Door\n🚨 ALARM, Group B: Window"
+
+
+def test_a_further_input_during_an_alarm_is_marked_as_an_update(tmp_path):
+    def two_inputs(alarm):
+        alarm["groups"][0]["inputs"].append(
+            {"mqtt": "in/window", "when": "is_on(value)", "label": "Window"}
+        )
+
+    service = make_service(tmp_path, two_inputs)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
+
+    send(service, "in/window", "1")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM (update), Group A: Door, Window'"})
+
+
+def test_one_group_clearing_reports_the_others_as_they_are(tmp_path):
+    def two_groups(alarm):
+        alarm["groups"].append(
+            {
+                "name": "gb",
+                "label": "Group B",
+                "default_enabled": True,
+                "inputs": [
+                    {"mqtt": "in/window", "when": "is_on(value)", "label": "Window"}
+                ],
+                "outputs": {"alarm": [{"siren": "intrusion"}, "sms"]},
+            }
+        )
+
+    service = make_service(tmp_path, two_groups)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'Group A' in m"})
+    send(service, "in/window", "1")
+    expect_next(service, {"out/sms": "'Group B' in m"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    seen = expect_next(service, {"out/sms": "'cleared' in m.lower()"})
+
+    assert texts_on(seen)[-1] == "⎚ Cleared, Group A\n🚨 ALARM, Group B: Window"
+
+
+# --------------------------------------------------------------------------
+# Notifications: one message when a problem starts, one when it ends
+# --------------------------------------------------------------------------
+
+
+def texts_on(seen, topic="out/sms"):
+    return [payload for t, payload in seen if t == topic]
+
+
+def test_a_silent_input_is_announced_once_and_when_it_returns(tmp_path):
+    """Repeating the same complaint every check turns the channel into noise."""
+
+    def silent(alarm):
+        group = alarm["groups"][0]
+        group["default_enabled"] = False  # keep the alarm path out of the way
+        group["inputs"][0]["silence_timeout"] = {"seconds": 1}
+
+    service = make_service(tmp_path, silent)
+
+    seen = expect_next(
+        service,
+        {"out/sms": "m.startswith('🔴') and 'Silent since launch' in m"},
+        2.0,
+    )
+    assert "[1 error, 0 warnings]" in texts_on(seen)[-1]
+
+    # The check keeps running -- and keeps quiet, because nothing changed.
+    expect_next(service, {"out/sms": None}, 2.5)
+
+    send(service, "in/door", "0")
+    seen = expect_next(service, {"out/sms": "m.startswith('🟢')"})
+    assert "Reporting again" in texts_on(seen)[-1]
+    assert "[0 errors, 0 warnings]" in texts_on(seen)[-1]
+    assert service.condition_counts() == (0, 0)
+
+
+def test_every_message_carries_the_number_of_active_problems(tmp_path):
+    def two_silent_inputs(alarm):
+        group = alarm["groups"][0]
+        group["default_enabled"] = False
+        group["inputs"][0]["silence_timeout"] = {"seconds": 1}
+        group["inputs"].append(
+            {
+                "mqtt": "in/window",
+                "when": "is_on(value)",
+                "label": "Window",
+                "silence_timeout": {"seconds": 1},
+            }
+        )
+
+    service = make_service(tmp_path, two_silent_inputs)
+
+    seen = expect_next(service, {"out/sms": ["m.startswith('🔴')", 2]}, 3.0)
+    messages = texts_on(seen)
+    assert any("[1 error, 0 warnings]" in m for m in messages)
+    assert any("[2 errors, 0 warnings]" in m for m in messages)
+    assert service.condition_counts() == (2, 0)
+
+    # One input recovering leaves the other one counted.
+    send(service, "in/door", "0")
+    seen = expect_next(service, {"out/sms": "m.startswith('🟢')"})
+    assert "[1 error, 0 warnings]" in texts_on(seen)[-1]
+
+
+def test_an_ignored_inhibitor_is_announced_as_a_warning(tmp_path):
+    """Failing open is a warning: the alarm still works, just not as configured."""
+
+    def with_inhibitor(alarm):
+        alarm["groups"][0]["inhibitors"] = [
+            {
+                "mqtt": "in/at_home",
+                "when": "is_on(value)",
+                "label": "At home",
+                "silence_timeout": {"seconds": 1},
+            }
+        ]
+
+    service = make_service(tmp_path, with_inhibitor)
+
+    send(service, "in/at_home", "1")
+
+    # Two distinct facts: the sensor is dead, and the alarm is consequently
+    # armed although the configuration says it should be inhibited.
+    seen = expect_next(
+        service, {"out/sms": ["m[0] in '🔴🟡'", 2]}, 3.0
+    )
+    messages = texts_on(seen)
+    assert any(m.startswith("🔴") and "Silent for" in m for m in messages)
+    assert any(
+        m.startswith("🟡") and "ignoring it so the alarm stays armed" in m
+        for m in messages
+    )
+    assert any("[1 error, 1 warning]" in m for m in messages)
+    assert service.condition_counts() == (1, 1)
+
+    expect_next(service, {"out/sms": None}, 2.5)
+
+    send(service, "in/at_home", "1")
+    expect_next(service, {"out/sms": ["m.startswith('🟢')", 2]}, 2.5)
+    assert service.condition_counts() == (0, 0)
+
+
+def test_an_unevaluatable_payload_is_announced_once(tmp_path):
+    """A sensor emitting garbage at 10 Hz must not bury everything else."""
+
+    def json_condition(alarm):
+        alarm["groups"][0]["inputs"][0]["when"] = "value_json['open'] == True"
+
+    service = make_service(tmp_path, json_condition)
+
+    send(service, "in/door", "ERROR: sensor fault")
+    seen = expect_next(service, {"out/sms": "m.startswith('🔴')"})
+    assert "cannot be evaluated" in texts_on(seen)[-1]
+
+    # Every further bad payload is silent (send() clears the queue first, so
+    # this really is what that one message caused).
+    for _ in range(3):
+        send(service, "in/door", "ERROR: sensor fault")
+        expect_next(service, {"out/sms": None}, 0.3)
+
+    send(service, "in/door", '{"open": false}')
+    seen = expect_next(service, {"out/sms": "m.startswith('🟢')"})
+    assert "evaluated again" in texts_on(seen)[-1]
+    assert service.condition_counts() == (0, 0)
+
+
+def test_a_liveness_failure_is_announced_once_and_when_it_recovers(tmp_path):
+    def with_liveness(alarm):
+        alarm["groups"][0]["liveness"] = [
+            {
+                "mqtt": "in/heartbeat",
+                "when": "is_on(value)",
+                "label": "Heartbeat",
+                "silence_timeout": {"hours": 1},
+                "invalid_response_timeout": {"seconds": 1},
+            }
+        ]
+
+    service = make_service(tmp_path, with_liveness)
+
+    send(service, "in/heartbeat", "1")
+    send(service, "in/heartbeat", "0")
+
+    seen = expect_next(service, {"out/sms": "m.startswith('🔴')"}, 2.5)
+    assert "Invalid response" in texts_on(seen)[-1]
+
+    expect_next(service, {"out/sms": None}, 2.0)
+
+    send(service, "in/heartbeat", "1")
+    seen = expect_next(service, {"out/sms": "m.startswith('🟢')"})
+    assert "Responding correctly again" in texts_on(seen)[-1]
+
+
+def test_a_problem_found_during_startup_is_sent_once_connected(tmp_path):
+    """Publishing before the first CONNACK is discarded, and there is no retry."""
+    import miqro.test.tools as tools
+
+    tools.SAVED_STATE.update(
+        {
+            "mqtt_input": {
+                "in/door": {
+                    "is_on(value)": {
+                        "last_state": {
+                            "last_raw_value": "0",
+                            "last_eval_value": False,
+                            "last_update": datetime.now() - timedelta(days=3),
+                            "state": InputState.ONLINE.value,
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    service = make_service(tmp_path, state_cls=DummyState)
+
+    assert not service.is_connected
+    assert service.condition_counts() == (1, 0), "the stale reading was not noticed"
+
+    seen = expect_next(service, {"out/sms": "m.startswith('🔴')"}, 2.0)
+    assert "Silent for" in texts_on(seen)[-1]
+
+
+def test_active_problems_are_listed_for_anything_that_missed_the_message(tmp_path):
+    def silent(alarm):
+        alarm["groups"][0]["default_enabled"] = False
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"seconds": 1}
+
+    service = make_service(tmp_path, silent)
+    assert service.condition_text() == "none"
+
+    expect_next(service, {"out/sms": "m.startswith('🔴')"}, 2.0)
+    assert "🔴" in service.condition_text()
+    assert "Silent since launch" in service.condition_text()
+
+
+# --------------------------------------------------------------------------
 # Fail-silent logic: healthy service that does not trigger
 # --------------------------------------------------------------------------
 
@@ -509,15 +804,28 @@ def test_inhibit_command_from_home_assistant_lasts(tmp_path):
     assert group.inhibit_timeout_loop.interval == timedelta(seconds=120)
 
 
-def test_reset_does_not_publish_an_empty_text_message(tmp_path):
-    """An empty payload to an SMS gateway is an empty SMS."""
+def test_reset_publishes_a_cleared_message_not_an_empty_one(tmp_path):
+    """An empty payload to an SMS gateway is an empty SMS -- but silence is worse.
+
+    Whoever was told that the alarm started is owed the other half of the story.
+    """
     service = make_service(tmp_path)
 
     send(service, "in/door", "1")
-    expect_next(service, {"out/sms": "'Group A' in m"})
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
 
     send(service, "service/alarm/ga/reset/command", "1")
-    expect_next(service, {"out/sms": None, "service/alarm/ga/state": "m == 'off'"}, 0.6)
+    expect_next(
+        service,
+        {
+            "out/sms": "m == '⎚ Cleared, Group A'",
+            "service/alarm/ga/state": "m == 'off'",
+        },
+        0.6,
+    )
+
+    # Said once: there is nothing left to report afterwards.
+    expect_next(service, {"out/sms": None}, 0.6)
 
 
 def test_self_test_exercises_the_text_output(tmp_path):
@@ -592,6 +900,106 @@ def test_group_without_outputs_is_rejected(tmp_path):
 
     with pytest.raises(Exception, match="no outputs at all"):
         make_service(tmp_path, no_outputs)
+
+
+def second_group_watching_the_door(alarm, **input_overrides):
+    """A second group whose input is the *same topic* as the first group's."""
+    door = {"mqtt": "in/door", "when": "is_on(value)", "label": "Door (hall)"}
+    door.update(input_overrides)
+    alarm["groups"].append(
+        {
+            "name": "gb",
+            "label": "Group B",
+            "inputs": [door],
+            "outputs": {"alarm": ["sms"]},
+        }
+    )
+
+
+def test_one_topic_with_two_different_silence_timeouts_is_reported(tmp_path):
+    """The same sensor cannot sensibly be online in one group and offline in another."""
+
+    def mismatched(alarm):
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"hours": 1}
+        second_group_watching_the_door(alarm, silence_timeout={"hours": 12})
+
+    service = make_service(tmp_path, mismatched)
+
+    assert service.condition_counts() == (0, 1)
+    seen = expect_next(service, {"out/sms": "m.startswith('🟡')"}, 2.0)
+    message = texts_on(seen)[-1]
+    assert "in/door" in message
+    assert "'Door' in group 'ga' (1 hour)" in message
+    assert "'Door (hall)' in group 'gb' (12 hours)" in message
+
+
+def test_disabled_and_enabled_silence_detection_on_one_topic_is_reported(tmp_path):
+    def half_disabled(alarm):
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"hours": 1}
+        second_group_watching_the_door(alarm, silence_timeout=None)
+
+    service = make_service(tmp_path, half_disabled)
+
+    assert service.condition_counts() == (0, 1)
+    assert "no silence detection" in service.condition_text()
+
+
+def test_one_topic_with_the_same_silence_timeout_is_fine(tmp_path):
+    """Watching one topic twice is legitimate -- disagreeing about it is not."""
+
+    def matched(alarm):
+        # One states the default explicitly, the other inherits it.
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"hours": 6}
+        second_group_watching_the_door(alarm, when="is_off(value)")
+
+    service = make_service(tmp_path, matched)
+
+    assert service.condition_counts() == (0, 0)
+    assert service.condition_text() == "none"
+
+
+def test_a_topic_inside_a_multi_input_is_checked_too(tmp_path):
+    """A MultiInput's children do their own silence detection, so they count."""
+
+    def nested(alarm):
+        alarm["groups"][0]["inputs"] = [
+            {
+                "label": "Either door",
+                "mode": "or",
+                "inputs": [
+                    {
+                        "mqtt": "in/door",
+                        "when": "is_on(value)",
+                        "label": "Front",
+                        "silence_timeout": {"minutes": 30},
+                    }
+                ],
+            }
+        ]
+        second_group_watching_the_door(alarm, silence_timeout={"hours": 12})
+
+    service = make_service(tmp_path, nested)
+
+    assert service.condition_counts() == (0, 1)
+    assert "'Front' in group 'ga' (30 minutes)" in service.condition_text()
+
+
+def test_an_inhibitor_sharing_a_topic_with_an_input_is_checked(tmp_path):
+    def input_and_inhibitor(alarm):
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"hours": 1}
+        alarm["groups"][0]["inhibitors"] = [
+            {
+                "mqtt": "in/door",
+                "when": "is_off(value)",
+                "label": "Door closed",
+                "silence_timeout": {"hours": 8},
+            }
+        ]
+
+    service = make_service(tmp_path, input_and_inhibitor)
+
+    assert service.condition_counts() == (0, 1)
+    assert "'Door closed' in group 'ga' (8 hours)" in service.condition_text()
 
 
 def test_shared_output_config_is_not_consumed_by_the_first_group(tmp_path):
