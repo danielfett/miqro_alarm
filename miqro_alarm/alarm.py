@@ -582,7 +582,7 @@ class MQTTInput(Input):
     # Kept short deliberately: an input that is allowed to stay quiet for days
     # can be dead for days before anyone is told, so a long window has to be an
     # explicit per-input decision.
-    DEFAULT_SILENCE_TIMEOUT: Dict = {"hours": 6}
+    DEFAULT_SILENCE_TIMEOUT: Dict = {"hours": 3}
 
     silence_timeout_check_loop: Optional[miqro.Loop] = None
 
@@ -805,10 +805,26 @@ class MQTTInput(Input):
             if self.last_update is not None:
                 self.service.log.error(
                     f"Input '{self.label}' | Stored last_update is "
-                    f"{self.last_update!r}, not a timestamp; treating as offline"
+                    f"{self.last_update!r}, not a timestamp; ignoring it"
                 )
             self.last_update = None
-            self._go_offline("Has not reported since the service was restarted")
+
+            # No timestamp means no evidence about *when* this input last
+            # reported -- an input that had simply not reported yet when the
+            # service was last stopped looks exactly like this.  Claiming it is
+            # offline here reports a dead sensor the instant the service starts,
+            # before the input has had any chance to say anything, so this run's
+            # silence timeout decides instead.
+            #
+            # Unless it was already offline before the restart: that means a
+            # full timeout did elapse without a message, which is evidence, and
+            # it is still true now.
+            if self.state == InputState.OFFLINE:
+                self._go_offline("Has never reported; still offline after a restart")
+            else:
+                # A stored 'online' with nothing behind it is not evidence
+                # either, and must not count as a trustworthy reading.
+                self.state = InputState.UNKNOWN
             return
 
         age = datetime.now() - self.last_update
@@ -835,7 +851,7 @@ class LivenessInput(MQTTInput):
         mqtt,
         when,
         label,
-        silence_timeout={"hours": 1},
+        silence_timeout={"hours": 3},
         invalid_response_timeout={"minutes": 3},
     ):
         super().__init__(

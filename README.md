@@ -132,6 +132,13 @@ Some deliberate choices about what happens when things go wrong:
  * **`silence_timeout` defaults to 6 hours** if not specified. Set it explicitly
    per input, or to `null` to disable silence detection for inputs that only
    report on change.
+ * **A restart does not reset the silence clock, and does not invent it either.**
+   A stored reading that is already older than its `silence_timeout` counts as
+   offline immediately, and one that is still fresh resumes the remaining time
+   rather than a full window. An input with no stored timestamp — one that had
+   not reported yet when the service was last stopped — is left `unknown` and
+   judged by this run's timeout, unless it was already `offline` before the
+   restart, which is evidence that survives.
  * **Inputs that share a topic must agree about it.** The same MQTT topic may be
    watched by several inputs — different groups, an input and an inhibitor,
    different `when` expressions on one sensor — but if they are configured with

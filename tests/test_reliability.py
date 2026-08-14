@@ -531,6 +531,65 @@ def test_a_liveness_failure_is_announced_once_and_when_it_recovers(tmp_path):
     assert "Responding correctly again" in texts_on(seen)[-1]
 
 
+def store_door_state(**overrides):
+    """Persist a reading for in/door as a previous run would have."""
+    import miqro.test.tools as tools
+
+    entry = {
+        "last_raw_value": None,
+        "last_eval_value": None,
+        "last_update": None,
+        "state": InputState.UNKNOWN.value,
+    }
+    entry.update(overrides)
+    tools.SAVED_STATE.update(
+        {"mqtt_input": {"in/door": {"is_on(value)": {"last_state": entry}}}}
+    )
+
+
+def test_an_input_that_had_not_reported_yet_is_not_declared_dead_at_startup(tmp_path):
+    """The state file is written every 30s whether or not anything arrived.
+
+    So an input that simply had not reported yet when the service was last
+    stopped has a stored record with no timestamp -- which must not be read as
+    evidence that it is dead, or every restart announces a dead sensor before
+    the input has had any chance to say anything.
+    """
+
+    def short_timeout(alarm):
+        alarm["groups"][0]["inputs"][0]["silence_timeout"] = {"seconds": 1}
+
+    store_door_state()  # never reported, and not offline when we stopped
+    service = make_service(tmp_path, short_timeout, state_cls=DummyState)
+
+    assert service.condition_counts() == (0, 0), "declared dead before it could report"
+    assert service.groups[0].inputs[0].get_state() == InputState.UNKNOWN
+
+    # This run's silence timeout still decides, in its own time.
+    seen = expect_next(service, {"out/sms": "m.startswith('🔴')"}, 2.5)
+    assert "Silent since launch" in texts_on(seen)[-1]
+
+
+def test_an_input_that_was_already_offline_is_reported_after_a_restart(tmp_path):
+    """A full timeout did elapse without a message: that is evidence, and it holds."""
+    store_door_state(state=InputState.OFFLINE.value)
+    service = make_service(tmp_path, state_cls=DummyState)
+
+    assert service.condition_counts() == (1, 0)
+    assert "still offline after a restart" in service.condition_text()
+
+
+def test_a_stored_online_reading_without_a_timestamp_is_not_trusted(tmp_path):
+    """'Online' with nothing behind it must not count as a live reading."""
+    store_door_state(last_eval_value=True, last_raw_value="1", state=InputState.ONLINE.value)
+    service = make_service(tmp_path, state_cls=DummyState)
+
+    door = service.groups[0].inputs[0]
+    assert door.get_state() == InputState.UNKNOWN
+    assert not door.is_live()
+    assert service.condition_counts() == (0, 0)
+
+
 def test_a_problem_found_during_startup_is_sent_once_connected(tmp_path):
     """Publishing before the first CONNACK is discarded, and there is no retry."""
     import miqro.test.tools as tools
