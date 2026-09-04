@@ -6,7 +6,7 @@ from datetime import timedelta, datetime
 from enum import Enum
 from dataclasses import dataclass, field
 from humanfriendly import format_timespan
-from json import loads
+from json import dumps, loads
 
 
 # Distinguishes "the configuration did not mention this" from an explicit null,
@@ -267,15 +267,46 @@ class TextOutput:
     service: "AlarmService"
     groups: List["AlarmGroup"]
     mqtt: Optional[str]
+    mqtt_clear: Optional[str]
+    mqtt_cancel: Optional[str]
     info: bool
+
+    # Set by AlarmService.create_outputs; also the default tag.
+    name: str = ""
 
     published_alarm_information: Optional[Dict] = None
 
-    def __init__(self, service, mqtt, info=False):
+    # Whether something this output announced may still be escalating on the
+    # far side, and whether the request to stop it has yet to get through.
+    tag_active: bool = False
+    cancel_pending: bool = False
+
+    def __init__(
+        self, service, mqtt, info=False, mqtt_clear=None, mqtt_cancel=None, tag=None
+    ):
         self.service = service
         self.mqtt = mqtt
+        # An all-clear is not an alarm, but it used to arrive in the same
+        # envelope as one -- at siren priority on a push gateway, or as another
+        # SMS in the middle of the night.  Routing it to its own topic is
+        # opt-in: left unset, clears go where they have always gone.
+        self.mqtt_clear = mqtt if mqtt_clear is None else mqtt_clear
+        # A notification gateway that keeps repeating an alarm until somebody
+        # acknowledges it needs to be told when the alarm is over; the tag is
+        # what identifies the messages to stop.
+        self.mqtt_cancel = mqtt_cancel
+        self.tag = tag
         self.info = info
         self.groups = []
+
+    def __str__(self):
+        return self.name or "unnamed"
+
+    @property
+    def cancel_tag(self) -> str:
+        # The output's name by default: it is what distinguishes this channel
+        # from every other sender that may share the same gateway.
+        return self.tag or self.name
 
     def add_group(self, group: "AlarmGroup"):
         if not group in self.groups:
@@ -307,6 +338,21 @@ class TextOutput:
             if label not in alarm_information
         ]
 
+        if self.mqtt_clear == self.mqtt:
+            self._publish_one_message(alarm_information, update_reason, cleared)
+        else:
+            self._publish_split_messages(alarm_information, update_reason, cleared)
+
+        if not alarm_information and self.tag_active:
+            # Nothing this output announced is active any more, so nothing it
+            # announced is still worth escalating.
+            self.tag_active = False
+            if self.mqtt_cancel:
+                self.cancel_pending = True
+                self.flush_cancel()
+
+    def _publish_one_message(self, alarm_information, update_reason, cleared):
+        """Everything on one topic: what happens when no clear topic is set."""
         message = self._format_msg(alarm_information, update_reason, cleared)
 
         if not message:
@@ -316,16 +362,97 @@ class TextOutput:
             self.published_alarm_information = alarm_information
             return
 
-        info = self.service.publish(self.mqtt, message, qos=1, global_=True)
-
         # Only remember what was published once it actually was: otherwise a
         # failed publish is recorded as delivered and the alarm text is never
         # retried, so the message is lost for good.
-        if info is not None and getattr(info, "rc", 0) == 0:
+        if self._publish(self.mqtt, message, tagged=True):
             self.published_alarm_information = alarm_information
+            self._announced()
         else:
             self.service.log.error(
                 f"TextOutput {self} | Publishing alarm text failed; will retry"
+            )
+
+    def _publish_split_messages(self, alarm_information, update_reason, cleared):
+        """Alarms on one topic, clears on another.
+
+        The two are committed separately, so a clear that was delivered is not
+        sent a second time because the alarm message that went with it failed.
+        """
+        published = dict(self.published_alarm_information or {})
+
+        if cleared:
+            if self._publish(
+                self.mqtt_clear, self._format_msg({}, update_reason, cleared)
+            ):
+                for label in cleared:
+                    del published[label]
+            else:
+                self.service.log.error(
+                    f"TextOutput {self} | Publishing cleared text failed; will retry"
+                )
+
+        # Only something new or changed belongs on the alarm topic.  A group
+        # ending does not: with everything in one message, clearing one alarm
+        # while another one runs restated the running one, which on a topic
+        # meant for alarms reads as a second alarm.
+        if any(published.get(label) != g for label, g in alarm_information.items()):
+            if self._publish(
+                self.mqtt,
+                self._format_msg(alarm_information, update_reason),
+                tagged=True,
+            ):
+                published.update(alarm_information)
+                self._announced()
+            else:
+                self.service.log.error(
+                    f"TextOutput {self} | Publishing alarm text failed; will retry"
+                )
+
+        self.published_alarm_information = published
+
+    def _announced(self):
+        """Record that a tagged message went out on the alarm topic."""
+        self.tag_active = True
+        # A cancel that has not got through is now stale: it would stop the
+        # message just sent, which is about an alarm that is still running.
+        self.cancel_pending = False
+
+    def _publish(self, topic, message, tagged=False) -> bool:
+        # Either key turns tagging on: naming a tag is enough for a gateway
+        # that is told to cancel from somewhere else.
+        if tagged and (self.tag or self.mqtt_cancel):
+            # A gateway that cancels by tag needs the tag on the message
+            # itself, and a plain-text payload has nowhere to put one.  Only
+            # the alarm topic is tagged: a clear is not something anyone would
+            # want to cancel later, and the clear topic may well be an SMS
+            # gateway that can only take text.
+            message = dumps(
+                {"message": message, "tags": self.cancel_tag}, ensure_ascii=False
+            )
+
+        info = self.service.publish(topic, message, qos=1, global_=True)
+        return info is not None and getattr(info, "rc", 0) == 0
+
+    def flush_cancel(self):
+        """Send a cancel that has not got through yet.
+
+        Worth retrying rather than announcing once: a cancel that is dropped
+        leaves a phone escalating an alarm that is over, for as long as the
+        gateway is configured to keep trying.
+        """
+        if not self.cancel_pending or not self.mqtt_cancel:
+            return
+
+        if self._publish(self.mqtt_cancel, self.cancel_tag):
+            self.service.log.info(
+                f"TextOutput {self} | Cancelled outstanding notifications "
+                f"tagged '{self.cancel_tag}'"
+            )
+            self.cancel_pending = False
+        else:
+            self.service.log.error(
+                f"TextOutput {self} | Publishing the cancel failed; will retry"
             )
 
     def send_info(self, message):
@@ -1652,7 +1779,11 @@ class AlarmService(miqro.Service):
         self.text_outputs = {}
         for name, config in self.service_config.get("text_outputs", {}).items():
             self.log.debug(f"Creating text output: {name}")
-            self.text_outputs[name] = TextOutput(self, **config)
+            # Set after construction rather than as a keyword argument, the way
+            # switch outputs are named below.
+            output = TextOutput(self, **config)
+            output.name = name
+            self.text_outputs[name] = output
 
         self.switch_outputs = {}
         for name, config in self.service_config.get("switch_outputs", {}).items():
@@ -1914,6 +2045,11 @@ class AlarmService(miqro.Service):
         self._pending_notifications = []
         for text in pending:
             self._send_notification(text)
+
+    @miqro.loop(seconds=1)
+    def _flush_text_output_cancels(self):
+        for output in self.text_outputs.values():
+            output.flush_cancel()
 
     @miqro.loop(seconds=1)
     def refresh_conditions(self):

@@ -62,6 +62,22 @@ services:
                    # output, in addition to the alarm messages themselves
       pushover_alarm:
         mqtt: service/pushover/send/alarm
+        mqtt_clear: service/pushover/send/info # Optional: where the "⎚ Cleared"
+                   # messages go. Defaults to the topic above, i.e., an all-clear
+                   # arrives in the same envelope as the alarm - which for a push
+                   # gateway means at alarm priority. Point it at a quieter topic
+                   # to separate the two.
+        mqtt_cancel: service/pushover/cancel/alarm # Optional: a gateway that
+                   # repeats an alarm until somebody acknowledges it (Pushover
+                   # priority 2) is told here that the alarm is over. Setting
+                   # this makes the messages on 'mqtt' JSON -
+                   # {"message": ..., "tags": ...} - so the gateway knows which
+                   # ones to stop; the cancel payload is that tag. Sent once no
+                   # group on this output is active any more, never while one
+                   # still is: the cancel stops every message carrying the tag.
+        tag: alarm_group # Optional, defaults to the name of this output
+                   # ("pushover_alarm"). Must be distinct from the tag of any
+                   # other sender using the same gateway.
       pushover_info:
         mqtt: service/pushover/send/info
         info: True

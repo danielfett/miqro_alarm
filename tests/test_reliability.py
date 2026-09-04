@@ -4,6 +4,7 @@ Each test here corresponds to a defect where the service kept running, and kept
 reporting itself healthy, while it had stopped being able to raise an alarm.
 """
 
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -376,6 +377,306 @@ def test_one_group_clearing_reports_the_others_as_they_are(tmp_path):
     seen = expect_next(service, {"out/sms": "'cleared' in m.lower()"})
 
     assert texts_on(seen)[-1] == "⎚ Cleared, Group A\n🚨 ALARM, Group B: Window"
+
+
+# --------------------------------------------------------------------------
+# A separate topic for the all-clear
+# --------------------------------------------------------------------------
+
+
+def with_clear_topic(alarm):
+    """Send this output's clears somewhere other than its alarms."""
+    alarm["text_outputs"]["sms"]["mqtt_clear"] = "out/sms_clear"
+
+
+def second_group(alarm):
+    alarm["groups"].append(
+        {
+            "name": "gb",
+            "label": "Group B",
+            "default_enabled": True,
+            "inputs": [
+                {"mqtt": "in/window", "when": "is_on(value)", "label": "Window"}
+            ],
+            "outputs": {"alarm": [{"siren": "intrusion"}, "sms"]},
+        }
+    )
+
+
+def test_the_all_clear_goes_to_the_clear_topic_and_not_the_alarm_topic(tmp_path):
+    """An all-clear on the alarm topic reaches people at alarm priority."""
+    service = make_service(tmp_path, with_clear_topic)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(
+        service,
+        {
+            "out/sms_clear": "m == '⎚ Cleared, Group A'",
+            "out/sms": None,
+        },
+        0.6,
+    )
+
+    # Said once, here as well.
+    expect_next(service, {"out/sms_clear": None, "out/sms": None}, 0.6)
+
+
+def test_clearing_one_group_does_not_restate_a_running_one_as_an_alarm(tmp_path):
+    """With one message for both, ending A resent B's line on the alarm topic.
+
+    Downstream that is indistinguishable from B having just started.
+    """
+
+    def two_groups(alarm):
+        with_clear_topic(alarm)
+        second_group(alarm)
+
+    service = make_service(tmp_path, two_groups)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'Group A' in m"})
+    send(service, "in/window", "1")
+    expect_next(service, {"out/sms": "'Group B' in m"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(
+        service,
+        {
+            "out/sms_clear": "m == '⎚ Cleared, Group A'",
+            "out/sms": None,
+        },
+        0.6,
+    )
+
+
+def test_a_failed_clear_is_retried_on_its_own(tmp_path, monkeypatch):
+    """Two topics, two publishes -- and each is only recorded once it worked.
+
+    Committing them together would mean a delivered clear is sent again because
+    the alarm message beside it failed, or the reverse.
+    """
+
+    def two_groups(alarm):
+        with_clear_topic(alarm)
+        second_group(alarm)
+
+    service = make_service(tmp_path, two_groups)
+
+    class FailedPublish:
+        rc = 1
+
+    failing = set()
+    real_publish = service.publish
+
+    def publish(topic, *args, **kwargs):
+        if topic in failing:
+            return FailedPublish()
+        return real_publish(topic, *args, **kwargs)
+
+    monkeypatch.setattr(service, "publish", publish)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
+
+    failing.add("out/sms_clear")
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(
+        service,
+        {
+            "service/alarm/ga/state": "m == 'off'",
+            "out/sms_clear": None,
+            "out/sms": None,
+        },
+        0.6,
+    )
+
+    # The next thing to happen carries the clear that never made it, without
+    # repeating the alarm message that did.
+    failing.clear()
+    send(service, "in/window", "1")
+    seen = expect_next(
+        service,
+        {
+            "out/sms_clear": "m == '⎚ Cleared, Group A'",
+            "out/sms": "m == '🚨 ALARM, Group B: Window'",
+        },
+    )
+    assert texts_on(seen) == ["🚨 ALARM, Group B: Window"]
+
+
+# --------------------------------------------------------------------------
+# Cancelling a notification that is still escalating
+# --------------------------------------------------------------------------
+
+
+def with_cancel(alarm):
+    """A gateway that repeats an alarm until it is told to stop."""
+    alarm["text_outputs"]["sms"].update(
+        mqtt_clear="out/sms_clear",
+        mqtt_cancel="out/sms_cancel",
+    )
+
+
+def test_a_tagged_alarm_carries_the_tag_the_gateway_cancels_by(tmp_path):
+    """Cancelling works by tag, and plain text has nowhere to put one."""
+    service = make_service(tmp_path, with_cancel)
+
+    send(service, "in/door", "1")
+    seen = expect_next(service, {"out/sms": "'ALARM' in m"})
+
+    assert json.loads(texts_on(seen)[-1]) == {
+        "message": "🚨 ALARM, Group A: Door",
+        "tags": "sms",  # the output's name, by default
+    }
+
+
+def test_the_last_group_clearing_cancels_what_is_still_escalating(tmp_path):
+    service = make_service(tmp_path, with_cancel)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'ALARM' in m"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(
+        service,
+        {
+            "out/sms_cancel": "m == 'sms'",
+            "out/sms_clear": "m == '⎚ Cleared, Group A'",
+        },
+        0.6,
+    )
+
+    # Said once: the gateway is not asked again on every later update.
+    expect_next(service, {"out/sms_cancel": None}, 0.6)
+
+
+@pytest.mark.parametrize(
+    "topic, payload",
+    [
+        ("service/alarm/ga/auto/command", "1"),  # the one-button way, mid-alarm
+        ("service/alarm/ga/enabled/command", "0"),
+        ("service/alarm/ga/reset/command", "1"),
+        ("service/alarm/reset/command", "1"),
+    ],
+)
+def test_every_way_of_switching_an_alarm_off_cancels_the_notification(
+    tmp_path, topic, payload
+):
+    """A gateway that repeats until acknowledged must hear about all of them.
+
+    'auto' in particular is how the alarm is switched off in passing, and it
+    reaches reset_outputs() by a different route than a reset command.
+    """
+    service = make_service(tmp_path, with_cancel)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'ALARM' in m"})
+
+    send(service, topic, payload)
+    expect_next(service, {"out/sms_cancel": "m == 'sms'"}, 0.6)
+
+
+def test_nothing_is_cancelled_while_another_group_is_still_in_alarm(tmp_path):
+    """One cancel stops every message carrying the tag, running ones included."""
+
+    def two_groups(alarm):
+        with_cancel(alarm)
+        second_group(alarm)
+
+    service = make_service(tmp_path, two_groups)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'Group A' in m"})
+    send(service, "in/window", "1")
+    expect_next(service, {"out/sms": "'Group B' in m"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(
+        service,
+        {
+            "out/sms_clear": "m == '⎚ Cleared, Group A'",
+            "out/sms_cancel": None,
+        },
+        0.6,
+    )
+
+    # Only once B ends as well is there nothing left to escalate.
+    send(service, "service/alarm/gb/reset/command", "1")
+    expect_next(service, {"out/sms_cancel": "m == 'sms'"}, 0.6)
+
+
+def test_a_failed_cancel_is_retried(tmp_path, monkeypatch):
+    """A dropped cancel leaves a phone escalating an alarm that is over."""
+    service = make_service(tmp_path, with_cancel)
+
+    class FailedPublish:
+        rc = 1
+
+    failing = set()
+    real_publish = service.publish
+
+    def publish(topic, *args, **kwargs):
+        if topic in failing:
+            return FailedPublish()
+        return real_publish(topic, *args, **kwargs)
+
+    monkeypatch.setattr(service, "publish", publish)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'ALARM' in m"})
+
+    failing.add("out/sms_cancel")
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(service, {"out/sms_clear": "'Cleared' in m", "out/sms_cancel": None}, 0.6)
+
+    # The retry loop keeps trying without anything else having to happen.
+    failing.clear()
+    expect_next(service, {"out/sms_cancel": "m == 'sms'"}, 2.5)
+
+
+def test_a_new_alarm_supersedes_a_cancel_that_never_got_through(tmp_path, monkeypatch):
+    """Sending it late would stop the alarm that is running right now."""
+    service = make_service(tmp_path, with_cancel)
+
+    class FailedPublish:
+        rc = 1
+
+    failing = {"out/sms_cancel"}
+    real_publish = service.publish
+
+    def publish(topic, *args, **kwargs):
+        if topic in failing:
+            return FailedPublish()
+        return real_publish(topic, *args, **kwargs)
+
+    monkeypatch.setattr(service, "publish", publish)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'ALARM' in m"})
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(service, {"out/sms_clear": "'Cleared' in m"}, 0.6)
+    assert service.text_outputs["sms"].cancel_pending
+
+    failing.clear()
+    send(service, "in/door", "0")
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "'ALARM' in m", "out/sms_cancel": None}, 0.6)
+
+    assert not service.text_outputs["sms"].cancel_pending
+
+
+def test_an_output_without_a_cancel_topic_still_sends_plain_text(tmp_path):
+    """Nothing changes for a gateway that was never told about tags."""
+    service = make_service(tmp_path)
+
+    send(service, "in/door", "1")
+    expect_next(service, {"out/sms": "m == '🚨 ALARM, Group A: Door'"})
+
+    send(service, "service/alarm/ga/reset/command", "1")
+    expect_next(service, {"out/sms": "m == '⎚ Cleared, Group A'"}, 0.6)
 
 
 # --------------------------------------------------------------------------
