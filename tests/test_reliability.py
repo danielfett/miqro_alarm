@@ -1385,3 +1385,72 @@ def test_shared_output_config_is_not_consumed_by_the_first_group(tmp_path):
     # Both groups actually got the switch output.
     assert len(service.groups[0].switch_outputs["alarm"]) == 1
     assert len(service.groups[1].switch_outputs["alarm"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Home Assistant: optional parent device with the alarms as child devices
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_ha_lists(monkeypatch):
+    # miqro keeps the Home Assistant devices in class attributes, shared by
+    # every service built in this process
+    def reset():
+        monkeypatch.setattr(AlarmService, "ha_devices", [])
+        monkeypatch.setattr(AlarmService, "ha_entities", [])
+
+    reset()
+    monkeypatch.setattr(AlarmService, "HA_PARENT_MIGRATION_DELAY", 0)
+    return reset
+
+
+def _discovery(service):
+    return [
+        (topic, payload)
+        for topic, payload in service.mqtt_client.message_queue
+        if topic.startswith("homeassistant/")
+    ]
+
+
+def _with_parent(alarm):
+    alarm["homeassistant"] = {"parent_device": "Alarmanlage"}
+
+
+def test_without_parent_device_every_alarm_is_a_device(tmp_path, fresh_ha_lists):
+    service = make_service(tmp_path)
+    service.mqtt_client.message_queue.clear()
+    service.mqtt_client.ensure_connected()
+    messages = _discovery(service)
+    assert [t for t, _ in messages] == ["homeassistant/device/alarm_Alarm-Group-A/config"]
+    assert "child_devices" not in json.loads(messages[0][1])
+
+
+def test_parent_device_holds_alarms_as_children(tmp_path, fresh_ha_lists):
+    standalone = make_service(tmp_path)  # what the alarm looked like before
+    before = standalone.groups[0].ha_device.build_discovery_payload()["components"]
+
+    fresh_ha_lists()
+    service = make_service(tmp_path, _with_parent, state_cls=DummyState)
+    service.mqtt_client.message_queue.clear()
+    service.mqtt_client.ensure_connected()
+    messages = _discovery(service)
+
+    # first the standalone device is removed, then the parent is announced
+    assert messages[0] == ("homeassistant/device/alarm_Alarm-Group-A/config", "")
+    assert messages[1][0] == "homeassistant/device/alarm_Alarmanlage/config"
+    assert len(messages) == 2
+    payload = json.loads(messages[1][1])
+    assert payload["components"] == {}
+    (child,) = payload["child_devices"]
+    assert child["name"] == "Alarm Group A"
+    assert child["identifiers"] == ["alarm_Alarm-Group-A"]
+    # same unique IDs as the standalone device: Home Assistant keeps the entities
+    assert set(child["components"]) == set(before)
+
+    # the standalone device is only removed once
+    fresh_ha_lists()
+    restarted = make_service(tmp_path, _with_parent, state_cls=DummyState)
+    restarted.mqtt_client.message_queue.clear()
+    restarted.mqtt_client.ensure_connected()
+    assert [t for t, p in _discovery(restarted) if p == ""] == []

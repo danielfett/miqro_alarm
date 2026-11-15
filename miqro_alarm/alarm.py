@@ -1,5 +1,6 @@
 import miqro
 import requests
+import time
 from itertools import count
 from typing import Callable, Optional, Dict, List, Tuple, Union
 from datetime import timedelta, datetime
@@ -1192,10 +1193,19 @@ class AlarmGroup:
         return self.priority < other.priority
 
     def setup_ha_entities(self):
-        self.ha_device = miqro.ha_sensors.Device(
-            self.service,
-            name=f"Alarm {self.label}",
-        )
+        parent = getattr(self.service, "ha_parent_device", None)
+        if parent is not None:
+            # Same name and therefore the same identifiers and unique IDs as
+            # the standalone device, so Home Assistant keeps the device.
+            self.ha_device = miqro.ha_sensors.ChildDevice(
+                parent,
+                name=f"Alarm {self.label}",
+            )
+        else:
+            self.ha_device = miqro.ha_sensors.Device(
+                self.service,
+                name=f"Alarm {self.label}",
+            )
 
         ha_enabled_switch = miqro.ha_sensors.Switch(
             device=self.ha_device,
@@ -1749,6 +1759,11 @@ class AlarmService(miqro.Service):
     debug_suppress_info_publish: bool = False
     publish_info_requested: bool = False
 
+    ha_parent_device = None
+    # Time for Home Assistant to drop the standalone alarm devices before they
+    # are announced again as child devices.
+    HA_PARENT_MIGRATION_DELAY = 2  # seconds
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -1756,6 +1771,7 @@ class AlarmService(miqro.Service):
         self._conditions: Dict[str, Condition] = {}
         self._pending_notifications: List[str] = []
 
+        self.ha_parent_device = self.create_ha_parent_device()
         self.create_outputs()
         self.create_alarm_groups()
         self.validate_configuration()
@@ -1774,6 +1790,43 @@ class AlarmService(miqro.Service):
                 self, **self.service_config["probe"], health_check=self.probe_healthy
             )
             self.probe_output.on()
+
+    def create_ha_parent_device(self):
+        """Optional device in Home Assistant that holds the alarms as child
+        devices (homeassistant.parent_device). Needs Home Assistant 2026.11 and
+        miqro with child device support; without the option every alarm is a
+        device of its own, as before."""
+        name = (self.service_config.get("homeassistant") or {}).get("parent_device")
+        if not name:
+            return None
+        if not hasattr(miqro.ha_sensors, "ChildDevice"):
+            raise Exception(
+                "homeassistant.parent_device needs miqro 1.4.0 or later "
+                "(child device support)"
+            )
+        return miqro.ha_sensors.Device(self, name=name)
+
+    def _publish_ha_discovery(self):
+        # Switching to child devices: the alarms were announced as standalone
+        # devices before. Home Assistant only turns an existing device into a
+        # child device (keeping its ID, area and entity settings) once the
+        # standalone discovery message is gone, so remove those first, once.
+        if self.ha_parent_device is not None and not self.state.get_path(
+            "ha_parent_device_migrated", default=False
+        ):
+            prefix = self.config.get("ha_discovery_prefix", "homeassistant")
+            for child in self.ha_parent_device.children:
+                self.log.info(f"Removing standalone Home Assistant device {child.name}")
+                self.mqtt_client.publish(
+                    f"{prefix}/device/{child._unique_id}/config",
+                    "",
+                    retain=True,
+                    qos=self.QOS_AT_LEAST_ONCE,
+                )
+            time.sleep(self.HA_PARENT_MIGRATION_DELAY)
+            self.state.set_path("ha_parent_device_migrated", value=True)
+            self.state.save()
+        super()._publish_ha_discovery()
 
     def create_outputs(self):
         self.text_outputs = {}

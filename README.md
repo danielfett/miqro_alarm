@@ -154,6 +154,32 @@ Some deliberate choices about what happens when things go wrong:
 
 When used with Homeassistant, the service publishes entities for every alarm. Each configured alarm is its own device.
 
+#### Optional: one device holding all alarms
+
+With Home Assistant 2026.11 or later, the alarms can be shown as child devices of one device:
+
+```yaml
+services:
+  alarm:
+    homeassistant:
+      parent_device: "Alarm system"
+```
+
+This needs miqro 1.4.0 or later and is off by default; older Home Assistant versions do not understand
+child devices. The alarm devices keep their names ("Alarm …"), IDs, areas and entities, so dashboards,
+automations and the examples below keep working. A child device without an area of its own uses the
+area of the parent device.
+
+On the first start with the option, the service removes the standalone alarm devices from the discovery
+topics (`homeassistant/device/alarm_Alarm-…/config`) before announcing them as child devices; Home
+Assistant then turns the existing devices into child devices. This happens once and is recorded in the
+state file (`ha_parent_device_migrated`).
+
+To go back to standalone devices, stop the service, clear the parent's discovery topic (for the example
+above: `mosquitto_pub -r -n -t homeassistant/device/alarm_Alarm-system/config`), remove
+`ha_parent_device_migrated` from the state file and the option from the configuration, and start the
+service again.
+
 #### Example: Interactive Alarm Overview
 
 Automatically generated overview of all alarms. When clicking an active alarm, it is muted. If the alarm is not active, clicking toggles between enabled/disabled.
