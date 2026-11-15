@@ -57,6 +57,99 @@ The configuration is based on a few concepts:
 
 See (examples/miqro.example.yml)[examples/miqro.example.yml] for configuration examples and explanations.
 
+### Alarm messages
+
+Text outputs receive one line per alarm group that is currently active, marked
+with that group's own state:
+
+```
+⚠️ Prealarm, Ground floor: Front door
+🚨 ALARM, Ground floor: Front door, Kitchen window
+🚨 ALARM (update), Ground floor: Front door, Kitchen window
+⎚ Cleared, Ground floor
+```
+
+A message is triggered by one group but restates all of them, so each line is
+marked according to the group it names — a group that is only in prealarm is
+never marked 🚨 because another group escalated. `(update)` means an additional
+input triggered while the group was already active.
+
+When a group's alarm ends it is reported as `⎚ Cleared`, including when other
+groups are still active (`⎚ Cleared, Ground floor` followed by the remaining
+`🚨 ALARM …` lines). Nothing is published when there is nothing to say.
+
+### Notifications
+
+Besides the alarm messages themselves, the service reports problems with itself
+and its sensors to every text output configured with `info: True`. These
+messages are about *conditions*, not events, and each condition produces exactly
+two messages: one when it starts and one when it ends.
+
+ * 🔴 **error** — something that is supposed to protect you does not: an input
+   that has gone silent, or one whose payload its `when` expression cannot
+   evaluate, a liveness check that keeps answering wrongly, an alarm output that
+   cannot be driven.
+ * 🟡 **warning** — the service still works, but not the way it is configured:
+   an inhibitor that is being ignored because it cannot be trusted, an input
+   holding an alarm open because it died while triggered. One-off events that
+   need saying but cannot "end" — for example an alarm being restored after a
+   restart — are also yellow.
+ * 🟢 **resolved** — a previously reported condition is over.
+
+Every message ends with the number of conditions that are active at that moment,
+for example `[1 error, 0 warnings]`, so a single message is enough to tell
+whether things are getting better or worse. Nothing is repeated while a
+condition persists: a sensor emitting garbage ten times a second is reported
+once. The current list is always available on `service/alarm/health/conditions`.
+
+Notifications raised before the broker connection is up — stale sensor readings
+found in the state file at startup, for instance — are held and sent once the
+service connects, rather than being silently dropped.
+
+### Reliability behaviour
+
+Some deliberate choices about what happens when things go wrong:
+
+ * **The configuration is validated at startup.** A group whose outputs reference a
+   schedule that does not define a message for the relevant state, an unknown
+   output name, a misspelled `prealarm`/`alarm` key, or a group with no inputs or
+   no outputs all cause the service to refuse to start. Previously these surfaced
+   as an exception at the moment the alarm fired, or not at all.
+ * **Inhibition fails open.** An inhibitor only suppresses an alarm while it is
+   online. An inhibitor whose last reading was "active" but which has since
+   stopped reporting is ignored, and a 🟡 warning is sent, so a dead presence
+   sensor cannot silently disarm the alarm.
+ * **Inputs must be understood to count as online.** If an input's `when`
+   expression cannot be evaluated for a payload, the input goes to
+   `invalid_response` rather than staying `online`, so a sensor emitting
+   unexpected values shows up in `all_inputs_online`.
+ * **Alarm state survives a restart.** An active alarm or prealarm is persisted
+   and re-asserted on startup, including re-sending the outputs and resuming a
+   prealarm's escalation timer.
+ * **A triggered input that goes offline holds the alarm.** Auto-reset via
+   `reset_delay` requires inputs to actually report as clear; an input that stops
+   reporting while triggered does not release the alarm.
+ * **`silence_timeout` defaults to 6 hours** if not specified. Set it explicitly
+   per input, or to `null` to disable silence detection for inputs that only
+   report on change.
+ * **A restart does not reset the silence clock, and does not invent it either.**
+   A stored reading that is already older than its `silence_timeout` counts as
+   offline immediately, and one that is still fresh resumes the remaining time
+   rather than a full window. An input with no stored timestamp — one that had
+   not reported yet when the service was last stopped — is left `unknown` and
+   judged by this run's timeout, unless it was already `offline` before the
+   restart, which is evidence that survives.
+ * **Inputs that share a topic must agree about it.** The same MQTT topic may be
+   watched by several inputs — different groups, an input and an inhibitor,
+   different `when` expressions on one sensor — but if they are configured with
+   *different* `silence_timeout`s, a 🟡 warning is sent at startup. They would
+   otherwise report one physical sensor as online and offline at the same time,
+   and they share a single slot in the state file, so whichever writes last
+   decides what the others remember after a restart. The service still starts.
+ * **The `probe` output only fires while the service is healthy.** If the broker
+   connection is down or the MQTT thread has died, the probe stops, so an external
+   dead-man's switch expires instead of reporting a service that cannot work.
+
 ### Optional Homeassistant Integration
 
 When used with Homeassistant, the service publishes entities for every alarm. Each configured alarm is its own device.
@@ -134,6 +227,12 @@ content: >-
 
 ```
 
+The same card works for the other three lists by replacing the entity pattern
+with `sensor.*_offline_inputs`, `sensor.*_active_inhibitors`, or
+`sensor.*_offline_inhibitors`. The offline lists are the ones worth putting on a
+dashboard permanently: an input that is offline is not watching anything, and an
+inhibitor that is offline is being ignored (see below).
+
 ### MQTT Topics
 
 #### :outbox_tray: Published Topics 
@@ -154,6 +253,14 @@ content: >-
 
  * `service/alarm/g1/display_state` — a unified view on the state of this alarm group: `disabled`, `inhibited`, `enabled`, `prealarm`, `alarm` — recommended for use in user interfaces
 
+ * `service/alarm/GROUP1/active_inputs_text` — comma-separated list of the inputs that are currently online *and* triggered, or `none`
+
+ * `service/alarm/GROUP1/offline_inputs_text` — comma-separated list of the inputs that are not online, each with its state in parentheses (e.g. `front door (offline)`), or `none`
+
+ * `service/alarm/GROUP1/active_inhibitors_text` — same as `active_inputs_text`, but for the inhibitors of this group
+
+ * `service/alarm/GROUP1/offline_inhibitors_text` — same as `offline_inputs_text`, but for the inhibitors of this group. An inhibitor listed here is *not* suppressing the alarm, even if its last known value was "active"
+
 **For each input of the group:**
 
  * `service/alarm/GROUP1/input/INPUT1/state` — the state of this input: `invalid_response`, `unknown`, `offline`, or `online`
@@ -163,6 +270,20 @@ content: >-
 Same for each inhibitor (`../inhibitor/..`) and liveness check (`../liveness/..`) of the alarm group.
 
 All outputs listed above are also published in a JSON object at `service/alarm/GROUP1/info`.
+
+**Service health:**
+
+ * `service/alarm/online` — `1` while the service is connected; set to `0` by the broker's last-will if it dies
+
+ * `service/alarm/health/ok` — `1` while the service is connected *and* its MQTT network thread is alive. Prefer this over `online` for monitoring: `online` only proves a process holds the connection.
+
+ * `service/alarm/health/failures` — count of problems that were caught and logged rather than crashing the service (failed publishes, handler exceptions, state save errors). A rising number means the service is degraded even though it is still running.
+
+ * `service/alarm/health/last_failure` — description of the most recent such problem
+
+ * `service/alarm/health/errors` / `service/alarm/health/warnings` — how many problem conditions are active right now (see [Notifications](#notifications))
+
+ * `service/alarm/health/conditions` — all active conditions as one line, or `none`. The notifications themselves are one-shot; this is what to look at after a restart or when a message was missed.
 
 #### :inbox_tray: Subscribed Topics
 
@@ -175,5 +296,11 @@ The following topics can be used to control the alarm groups:
 
  * `service/alarm/GROUP1/reset/command` — send `1` to reset the alarm when it is active (in `alarm` or `prealarm` state)
 
- * `service/alarm/GROUP1/reset/auto/command` — send `1` to reset the alarm, if it is in `alarm` or `prealarm` state; otherwise, the alarm is disabled or enabled — this is to be used in user interfaces
+ * `service/alarm/GROUP1/auto/command` — send `1` to reset the alarm, if it is in `alarm` or `prealarm` state; otherwise, the alarm is disabled or enabled — this is to be used in user interfaces
+
+ * `service/alarm/reset/command` — send `1` to reset *every* alarm group at once
+
+ * `service/alarm/test/command` — send `1` to run an output self-test: a clearly marked test message is sent to every text output, and the result is published to `service/alarm/test/result`. Use this to verify that notification paths still work without waiting for a real alarm.
+
+Note that `inhibited/command` accepts the same on/off spellings as the other command topics (`1`, `on`, `true`, …), or a number of seconds to inhibit for (`120` inhibits for two minutes). A plain `1` inhibits for the default of 30 minutes.
 
