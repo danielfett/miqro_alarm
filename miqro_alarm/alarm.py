@@ -2095,12 +2095,19 @@ class AlarmService(miqro.Service):
         self.publish_info_requested = True
 
     def publish_info(self):
+        # Retained: the per-key topics are only sent when they change, so a
+        # subscriber that (re)connects later -- Home Assistant after a restart --
+        # would otherwise see nothing until the next change and show "unknown"
+        # for days. Stale values are not a risk: the HA entities use the
+        # service's online/will topic for availability.
         data = {group.name: group.get_state() for group in self.groups}
-        self.publish_json_keys(data, only_if_changed=True)
-        self.publish_json("info", data, only_if_changed=timedelta(seconds=60))
+        self.publish_json_keys(data, retain=True, only_if_changed=True)
+        self.publish_json("info", data, retain=True, only_if_changed=timedelta(seconds=60))
         for group in self.groups:
             data = group.get_state()
-            self.publish_json(f"{group.name}/info", data, only_if_changed=timedelta(seconds=30))
+            self.publish_json(
+                f"{group.name}/info", data, retain=True, only_if_changed=timedelta(seconds=30)
+            )
 
     # Note: @miqro.handle registers the undecorated function, so dispatch calls
     # it as handler(service, payload) -- these take (self, msg), unlike the
