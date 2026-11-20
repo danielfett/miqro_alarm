@@ -641,6 +641,8 @@ class Input:
             self.group.on(self)
         else:
             self.group.off(self)
+        # Also covers debounced inputs, whose value is committed later from a loop.
+        self.service.request_publish_info()
 
     def _debounce_timeout_check(self, _):
         self.service.log.info(
@@ -788,6 +790,7 @@ class MQTTInput(Input):
         return True, value
 
     def handle(self, _, raw_value):
+        old_state, old_eval_value = self.state, self.last_eval_value
         self.last_update = datetime.now()
         self.last_raw_value = raw_value
         if self.silence_timeout_check_loop:
@@ -804,6 +807,7 @@ class MQTTInput(Input):
 
         self._handle_change(new_eval_value)
         self._store_state()
+        self._publish_if_changed(old_state, old_eval_value)
 
     def _report_reception(self, ok: bool, raw_value: str):
         """Update the conditions that a received message settles.
@@ -828,8 +832,20 @@ class MQTTInput(Input):
     def _describe(self) -> str:
         return f"Group {self.group}, input {self}"
 
+    def _publish_if_changed(self, old_state, old_eval_value):
+        """Publish the group info right away when this input's state or value changed.
+
+        Without this a change only became visible with the periodic publish (every
+        180 s): an inhibitor going inactive left the group showing "inhibited" for
+        up to three minutes although it was already armed.
+        """
+        if self.state != old_state or self.last_eval_value != old_eval_value:
+            self.service.request_publish_info()
+
     def _go_offline(self, detail: str):
         """Mark the input untrustworthy and say so, once."""
+        if self.state != InputState.OFFLINE:
+            self.service.request_publish_info()
         self.state = InputState.OFFLINE
         self.service.raise_condition(
             self.condition_key("input-silent"),
@@ -997,6 +1013,7 @@ class LivenessInput(MQTTInput):
         self.service.add_loop(self.invalid_response_timeout_check_loop)
 
     def handle(self, _, raw_value):
+        old_state, old_eval_value = self.state, self.last_eval_value
         self.last_update = datetime.now()
         self.last_raw_value = raw_value
 
@@ -1019,6 +1036,7 @@ class LivenessInput(MQTTInput):
 
         self._handle_change(new_eval_value)
         self._store_state()
+        self._publish_if_changed(old_state, old_eval_value)
 
     def _describe(self) -> str:
         return f"Group {self.group}, liveness input {self}"

@@ -117,13 +117,14 @@ def test_input_goes_on_and_times_out(service):
         },
     )
 
-    run(service, 2)
-    service.publish_info()
+    # The input requests an immediate publish when it goes offline, so the
+    # change appears without waiting for the periodic publish.
     expect_next(
         service,
         {
             "service/alarm/g1/input/Input 2/state": 'm == "offline"',
         },
+        timeout=3,
     )
 
     send(service, "group1/input2", "1")
@@ -441,6 +442,25 @@ def test_alarm_not_triggered_by_inhibitor(service_no_info_interval):
             "service/alarm/g1/state": "m == 'off'",
             "switch/sw1": None,
         },
+        1,
+    )
+
+
+def test_inhibitor_change_is_published_immediately(service_no_info_interval):
+    """The group info follows an inhibitor right away, not with the periodic
+    publish (disabled in this fixture). Used to lag by up to 180 s."""
+    service = service_no_info_interval
+    send(service, "service/alarm/g1/enabled/command", "1")
+    send(service, "group1/inhibitor1", "1")
+    expect_next(
+        service,
+        {"service/alarm/g1/display_state": eventually("m == 'inhibited'")},
+        1,
+    )
+    send(service, "group1/inhibitor1", "0")
+    expect_next(
+        service,
+        {"service/alarm/g1/display_state": "m == 'enabled'"},
         1,
     )
 
